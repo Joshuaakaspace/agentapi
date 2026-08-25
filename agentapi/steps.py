@@ -14,6 +14,7 @@ import hashlib
 from typing import Any, Callable, Optional, TypeVar
 
 from .context import get_ctx, parse_duration
+from .determinism import suppressed
 
 F = TypeVar("F", bound=Callable[..., Any])
 
@@ -54,9 +55,12 @@ def step(fn: Optional[F] = None, *, retries: int = 0,
             for attempt in range(retries + 1):
                 context.check()
                 try:
-                    coro = func(*args, **kwargs)
-                    result = (await asyncio.wait_for(coro, timeout_s)
-                              if timeout_s else await coro)
+                    # A step's result is journaled, so nondeterminism
+                    # inside it is fine — that is the entire point of steps.
+                    with suppressed():
+                        coro = func(*args, **kwargs)
+                        result = (await asyncio.wait_for(coro, timeout_s)
+                                  if timeout_s else await coro)
                     journal[key] = result
                     if context._step_commit is not None:
                         context._step_commit(key, result)

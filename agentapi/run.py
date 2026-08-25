@@ -15,6 +15,7 @@ from typing import Any, AsyncIterator, Callable, Optional
 
 from .context import (DeadlineExceeded, BudgetExceeded, RunCancelled,
                       RunContext, _current)
+from .determinism import NondeterminismError, guarding, real_time
 from .events import Done, Event, EventLog, Paused, Resumed, RunError
 
 
@@ -44,7 +45,7 @@ class Run:
         self.ctx = ctx
         self.log = log
         self.status = RunStatus.QUEUED
-        self.created_at = time.time()
+        self.created_at = real_time()
         self.finished_at: Optional[float] = None
         self.attached = 0            # live transport subscribers
         self.task: Optional[asyncio.Task[None]] = None
@@ -97,7 +98,8 @@ class RunManager:
               hooks: Any = None,
               durable: bool = False,
               run_id: Optional[str] = None,
-              replay_events: Optional[list[Event]] = None) -> Run:
+              replay_events: Optional[list[Event]] = None,
+              determinism: str = "off") -> Run:
         recovering = run_id is not None
         run_id = run_id or f"run_{uuid.uuid4().hex[:20]}"
         context = ctx or RunContext(run_id)
@@ -105,6 +107,7 @@ class RunManager:
         log = EventLog()
         run = Run(run_id, route, context, log)
         run.durable = durable
+        run.determinism = determinism if durable else "off"
         self.runs[run_id] = run
         if idempotency_key:
             self._idempotency[idempotency_key] = run_id
@@ -134,6 +137,12 @@ class RunManager:
                         replay_cursor[0] = index + 1
                         self._track_pause(run, replay[index][1])
                         return replay[index][1]
+                # Nothing ahead matches, yet history still has events the
+                # replay should have reproduced: the handler took a
+                # different path this time. (An event lost to the crash
+                # would sit at the tail, where the cursor is already spent
+                # and this branch is not reached.)
+                self._diverged(run, event, replay[replay_cursor[0]][1])
             appended = await log.append(event)
             self._track_pause(run, appended)
             if backend is not None:
@@ -152,6 +161,22 @@ class RunManager:
             self._execute(run, handler, kwargs, hooks), name=f"agentapi:{run_id}")
         return run
 
+    def _diverged(self, run: Run, emitted: Event, expected: Event) -> None:
+        """A replayed run emitted an event its recorded history does not
+        contain — proof that something outside the journal changed."""
+        message = (
+            f"replay of run {run.id} diverged: emitted {emitted.type!r} where "
+            f"the journal recorded {expected.type!r} (seq {expected.seq}). "
+            f"Handler code is not reproducible — check for unjournaled "
+            f"clock, randomness or I/O outside a @step."
+        )
+        mode = getattr(run, "determinism", "off")
+        if mode == "raise":
+            raise NondeterminismError(message)
+        if mode == "warn":
+            import logging
+            logging.getLogger("agentapi.determinism").warning(message)
+
     def _track_pause(self, run: Run, event: Event) -> None:
         if event.type == "paused" and run.status == RunStatus.RUNNING:
             run.status = RunStatus.PAUSED
@@ -162,10 +187,14 @@ class RunManager:
                        kwargs: dict[str, Any], hooks: Any) -> None:
         run.status = RunStatus.RUNNING
         token = _current.set(run.ctx)
+        mode = getattr(run, "determinism", "off")
+        guard_cm = None
         try:
             if hooks is not None:
                 await hooks.fire("on_run_start", run)
             result: Any = None
+            guard_cm = guarding(mode, run.id)
+            guard_cm.__enter__()
             if inspect.isasyncgenfunction(handler):
                 async for event in handler(**kwargs):
                     run.ctx.check()
@@ -184,10 +213,15 @@ class RunManager:
                     result = None
             else:
                 result = await handler(**kwargs)
+            guard_cm.__exit__(None, None, None)
+            guard_cm = None
             if not run.log.closed:
                 await run.ctx.emit(Done(result=_plain(result),
                                         usage=run.ctx.usage.as_dict()))
             run.status = RunStatus.COMPLETED
+        except NondeterminismError as exc:
+            run.status = RunStatus.FAILED
+            await self._fail(run, str(exc), kind="nondeterminism")
         except (RunCancelled, asyncio.CancelledError):
             run.status = RunStatus.CANCELLED
             await self._fail(run, "run cancelled", kind="cancelled")
@@ -201,7 +235,12 @@ class RunManager:
             run.status = RunStatus.FAILED
             await self._fail(run, f"{type(exc).__name__}: {exc}", kind="error")
         finally:
-            run.finished_at = time.time()
+            try:
+                if guard_cm is not None:
+                    guard_cm.__exit__(None, None, None)
+            except Exception:  # noqa: BLE001 - never mask the real outcome
+                pass
+            run.finished_at = real_time()
             if getattr(run, "durable", False) and self.backend is not None:
                 self.backend.update_status(run.id, run.status.value,
                                            finished=True)

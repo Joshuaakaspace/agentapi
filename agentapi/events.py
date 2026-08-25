@@ -8,10 +8,11 @@ makes streams resumable and runs watchable by more than one client.
 from __future__ import annotations
 
 import asyncio
-import time
 from typing import Any, AsyncIterator, Optional
 
 from pydantic import BaseModel, Field
+
+from .determinism import real_time
 
 
 class Event(BaseModel):
@@ -148,7 +149,7 @@ class EventLog:
         if len(self._events) >= self._max:
             raise RuntimeError(f"event log overflow (> {self._max} events)")
         event.seq = len(self._events)
-        event.ts = time.time()
+        event.ts = real_time()
         self._events.append(event)
         if event.type in TERMINAL_TYPES:
             self._closed = True

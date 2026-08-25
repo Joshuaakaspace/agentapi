@@ -779,3 +779,195 @@ async def test_archived_run_readable_from_journal_after_restart(tmp_path):
     assert info["archived"] is True and info["status"] == "completed"
     assert events["closed"] is True
     assert [e["type"] for e in events["events"]][-1] == "done"
+
+
+# --- determinism checking -------------------------------------------------
+
+async def test_raw_clock_in_durable_handler_is_rejected(tmp_path):
+    import time as time_module
+
+    app = AgentAPI(llm=MockLLM(), durable=str(tmp_path / "d.db"))
+
+    @app.run("/sloppy", durability="durable")
+    async def sloppy():
+        yield StateDelta(data={"stamped": time_module.time()})  # not replayable
+        yield Done()
+
+    async with client_for(app) as client:
+        async with client.stream("POST", "/sloppy", json={}) as response:
+            events = await sse_events(response)
+    assert events[-1]["event"] == "error"
+    assert events[-1]["data"]["kind"] == "nondeterminism"
+    assert "time.time" in events[-1]["data"]["error"]
+    assert "ctx.now()" in events[-1]["data"]["error"]   # names the remedy
+
+
+async def test_raw_randomness_and_uuid_are_rejected(tmp_path):
+    import random as random_module
+    import uuid as uuid_module
+
+    for label, offender in (("random", lambda: random_module.random()),
+                            ("uuid", lambda: str(uuid_module.uuid4()))):
+        app = AgentAPI(llm=MockLLM(), durable=str(tmp_path / f"{label}.db"))
+
+        @app.run("/x", durability="durable")
+        async def handler(_offender=offender):
+            yield StateDelta(data={"v": _offender()})
+            yield Done()
+
+        async with client_for(app) as client:
+            async with client.stream("POST", "/x", json={}) as response:
+                events = await sse_events(response)
+        assert events[-1]["data"]["kind"] == "nondeterminism", label
+
+
+async def test_ctx_accessors_and_steps_are_allowed(tmp_path):
+    import time as time_module
+
+    app = AgentAPI(llm=MockLLM(), durable=str(tmp_path / "ok.db"))
+
+    @step
+    async def stamped() -> float:
+        return time_module.time()      # fine: a step's result is journaled
+
+    @app.run("/clean", durability="durable")
+    async def clean():
+        yield StateDelta(data={
+            "now": ctx.now(), "uuid": ctx.uuid(), "rand": ctx.random(),
+            "step": await stamped(),
+        })
+        yield Done(result="clean")
+
+    async with client_for(app) as client:
+        async with client.stream("POST", "/clean", json={}) as response:
+            events = await sse_events(response)
+    assert events[-1]["event"] == "done"
+    assert events[-1]["data"]["result"] == "clean"
+
+
+async def test_checker_is_inert_outside_durable_runs():
+    import time as time_module
+
+    app = AgentAPI(llm=MockLLM())          # no journal -> nothing to corrupt
+
+    @app.run("/loose")                      # default durability="resumable"
+    async def loose():
+        yield StateDelta(data={"t": time_module.time()})
+        yield Done(result="fine")
+
+    async with client_for(app) as client:
+        async with client.stream("POST", "/loose", json={}) as response:
+            events = await sse_events(response)
+    assert events[-1]["data"]["result"] == "fine"
+    # and plain module use outside any run is untouched
+    assert isinstance(time_module.time(), float)
+
+
+async def test_warn_mode_records_violation_without_failing(tmp_path):
+    import time as time_module
+
+    app = AgentAPI(llm=MockLLM(), durable=str(tmp_path / "w.db"),
+                   determinism="warn")
+
+    @app.run("/noisy", durability="durable")
+    async def noisy():
+        yield StateDelta(data={"t": time_module.time()})
+        yield Done(result="survived")
+
+    with pytest.warns(RuntimeWarning, match="nondeterministic"):
+        async with client_for(app) as client:
+            async with client.stream("POST", "/noisy", json={}) as response:
+                events = await sse_events(response)
+    assert events[-1]["data"]["result"] == "survived"
+
+
+async def test_ctx_now_replays_the_recorded_timestamp(tmp_path):
+    """The bug this fixes: ctx.now() used to return live wall clock, so a
+    recovered run saw a different 'now' than the execution it replaced."""
+    db = tmp_path / "now.db"
+
+    def build():
+        app = AgentAPI(llm=MockLLM(), durable=str(db))
+
+        class Approval(BaseModel):
+            approved: bool
+
+        @app.run("/stamp", durability="durable")
+        async def stamp():
+            yield StateDelta(data={"started": ctx.now(), "id": ctx.uuid()})
+            approval = await ctx.pause("approval", schema=Approval,
+                                       timeout="60s")
+            yield Done(result={"started": ctx.now(), "ok": approval.approved})
+        return app
+
+    app1 = build()
+    async with live_app(app1) as client:
+        async with client.stream("POST", "/stamp", json={}) as response:
+            run_id = response.headers["x-run-id"]
+            async for line in response.aiter_lines():
+                if line.startswith("event: paused"):
+                    break
+    first = app1.runs.get(run_id).log.read(0)[0].data
+    app1.runs.get(run_id).durable = False
+    app1.runs.get(run_id).task.cancel()
+    try:
+        await app1.runs.get(run_id).task
+    except (asyncio.CancelledError, Exception):
+        pass
+
+    await asyncio.sleep(0.01)              # ensure wall clock has moved on
+    app2 = build()
+    app2.recover()
+    run2 = app2.runs.get(run_id)
+    app2.runs.signal(run_id, "approval", {"approved": True})
+    await asyncio.wait_for(run2.task, timeout=2)
+    assert run2.status.value == "completed"
+
+    replayed = run2.log.read(0)[0].data
+    assert replayed["started"] == first["started"]   # same clock, not "now"
+    assert replayed["id"] == first["id"]             # same id
+
+
+async def test_replay_divergence_is_detected(tmp_path):
+    """Reactive half: even nondeterminism the patches cannot see (here, an
+    external mutable) is caught when the replay stops matching history."""
+    db = tmp_path / "div.db"
+    path_choice = {"value": "left"}
+
+    def build():
+        app = AgentAPI(llm=MockLLM(), durable=str(db))
+
+        class Approval(BaseModel):
+            approved: bool
+
+        @app.run("/forky", durability="durable")
+        async def forky():
+            yield StateDelta(data={"branch": path_choice["value"]})
+            approval = await ctx.pause("approval", schema=Approval,
+                                       timeout="60s")
+            yield Done(result=approval.approved)
+        return app
+
+    app1 = build()
+    async with live_app(app1) as client:
+        async with client.stream("POST", "/forky", json={}) as response:
+            run_id = response.headers["x-run-id"]
+            async for line in response.aiter_lines():
+                if line.startswith("event: paused"):
+                    break
+    app1.runs.get(run_id).durable = False
+    app1.runs.get(run_id).task.cancel()
+    try:
+        await app1.runs.get(run_id).task
+    except (asyncio.CancelledError, Exception):
+        pass
+
+    path_choice["value"] = "right"        # the world changed under the replay
+    app2 = build()
+    app2.recover()
+    run2 = app2.runs.get(run_id)
+    await asyncio.wait_for(run2.task, timeout=2)
+    assert run2.status.value == "failed"
+    terminal = run2.log.read(0)[-1]
+    assert terminal.kind == "nondeterminism"
+    assert "diverged" in terminal.error

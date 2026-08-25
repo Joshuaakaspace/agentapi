@@ -72,18 +72,43 @@ GET  /pools                    admission stats     GET /healthz
 Recovery is replay-based: `app.recover()` re-executes unfinished durable
 runs from the top — `@step` results return from the journal instead of
 re-running side effects, past signals re-deliver the same payloads, and
-re-emitted events are deduplicated against persisted history. Anything
-nondeterministic belongs in a `@step` or behind `ctx.now()/ctx.uuid()/
-ctx.random()`.
+re-emitted events are deduplicated against persisted history.
+
+### Determinism is checked, not just documented
+
+Replay only works if a handler re-run takes the same path. A stray
+`time.time()` would silently corrupt the journal, so the runtime catches it
+two ways:
+
+- **Proactively** — `time`/`random`/`uuid` calls made inside a durable
+  handler *outside a step* raise `NondeterminismError` at the offending
+  line, naming the fix. The wrappers are inert everywhere else: they act
+  only on tasks running durable handler code, so other threads, tasks and
+  libraries are untouched.
+- **Reactively** — during recovery, an emitted event matching nothing in
+  the remaining history proves divergence, whatever the cause (`datetime.now()`,
+  dict ordering, an unjournaled read). The run fails loudly instead of
+  writing a corrupt journal.
+
+`ctx.now()`, `ctx.uuid()` and `ctx.random()` are **journaled**: a recovered
+run sees the same clock, ids and dice as the execution it resumes. Anything
+else nondeterministic belongs inside a `@step`, whose result is journaled.
+
+Set the policy with `AgentAPI(determinism="raise" | "warn" | "off")`
+(default `"raise"`; applies to durable runs only).
 
 ## Status
 
-Working core with a 28-test suite: run lifecycle, resume-by-cursor,
+Working core with a 35-test suite: run lifecycle, resume-by-cursor,
 detach/cancel policies, budgets, deadlines, pause/signal, steps, all three
-op surfaces, the agent loop, hooks, skills, pools, and crash recovery
-(incl. crash-mid-stream with no duplicated events). Postgres backend,
-prefix-cache-aware routing, and the replay/eval CLI are designed in
-DESIGN.md but not built yet.
+op surfaces, the agent loop, hooks, skills, pools, crash recovery (incl.
+crash-mid-stream with no duplicated events), and determinism checking.
+
+Not built yet (designed in DESIGN.md): the `agentapi replay`/`eval` CLI,
+Postgres backend and journal group-commit, per-tenant fair queueing and
+adaptive rate limits in pools, `on_disconnect="drain"`, typed streaming
+output (`Partial[Model]`), session affinity / prefix-cache-aware routing,
+and an OpenAI-compatible `/v1/chat/completions` surface.
 
 ```bash
 pip install -e ".[dev]" && pytest

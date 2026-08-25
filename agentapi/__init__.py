@@ -6,6 +6,7 @@ admission control, and one op definition serving HTTP + LLM tools + MCP.
 from .app import AgentAPI
 from .context import (BudgetExceeded, DeadlineExceeded, RunCancelled,
                       RunContext, ctx, get_ctx)
+from .determinism import NondeterminismError
 from .events import (Done, Event, Message, Paused, Resumed, RunError,
                      StateDelta, Token, ToolCall, ToolResult)
 from .hooks import Hooks
@@ -20,7 +21,8 @@ __version__ = "0.1.0"
 __all__ = [
     "AgentAPI", "AnthropicLLM", "BaseLLM", "BudgetExceeded",
     "DeadlineExceeded", "Done", "Event", "Hooks", "Message", "MockLLM",
-    "Paused", "Pool", "PoolSaturated", "Resumed", "Run", "RunCancelled",
+    "NondeterminismError", "Paused", "Pool", "PoolSaturated", "Resumed",
+    "Run", "RunCancelled",
     "RunContext", "RunError", "RunManager", "RunStatus", "Skill",
     "StateDelta", "Token", "ToolCall", "ToolResult", "ctx", "get_ctx",
     "step",

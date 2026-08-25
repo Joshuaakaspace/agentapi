@@ -38,6 +38,7 @@ from starlette.responses import JSONResponse, Response, StreamingResponse
 from starlette.routing import Route
 
 from .context import RunContext, parse_duration
+from .determinism import MODES as DETERMINISM_MODES
 from .events import parse_event
 from .hooks import Hooks
 from .journal import SQLiteBackend
@@ -69,7 +70,12 @@ class AgentAPI:
     def __init__(self, *, title: str = "agentapi", version: str = "0.1.0",
                  llm: Optional[BaseLLM] = None,
                  retention_s: float = 3600.0,
-                 durable: Optional[str] = None) -> None:
+                 durable: Optional[str] = None,
+                 determinism: str = "raise") -> None:
+        if determinism not in DETERMINISM_MODES:
+            raise ValueError(
+                f"determinism must be one of {DETERMINISM_MODES}")
+        self.determinism = determinism
         self.title = title
         self.version = version
         self.llm = llm
@@ -203,7 +209,8 @@ class AgentAPI:
         run = self.runs.start(route.path, route.handler, kwargs,
                               ctx=context, idempotency_key=idempotency_key,
                               hooks=self.hooks,
-                              durable=route.durability == "durable")
+                              durable=route.durability == "durable",
+                              determinism=self.determinism)
         return run, True
 
     # -- recovery (tier-2 durability) ---------------------------------------
@@ -233,7 +240,8 @@ class AgentAPI:
                              for e in self.backend.events(row["id"])]
             self.runs.start(route.path, route.handler, row["kwargs"],
                             ctx=context, hooks=self.hooks, durable=True,
-                            run_id=row["id"], replay_events=replay_events)
+                            run_id=row["id"], replay_events=replay_events,
+                            determinism=self.determinism)
             recovered.append(row["id"])
         return recovered
 

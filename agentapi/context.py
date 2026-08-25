@@ -18,6 +18,7 @@ from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
 from typing import Any, Optional
 
+from .determinism import NondeterminismError, real_time, suppressed
 from .events import Event, Paused, Resumed
 
 
@@ -121,17 +122,39 @@ class RunContext:
         self._llm = None              # wired by the app (LLM client facade)
         self._step_journal: dict[str, Any] = {}
         self._step_commit = None      # durable backend hook, wired by the app
+        self._det_seq = 0             # ordinal for journaled ctx.now/uuid/random
         self._rng = _random.Random(run_id)  # deterministic per run
 
     # -- identity / determinism helpers ------------------------------------
+    # These are the replay-safe alternatives to time.time()/uuid4()/random().
+    # Each records its value in the run journal the first time it is called
+    # and returns the recorded value on replay, so a recovered run sees the
+    # same clock, ids and dice as the original execution.
+    def _journaled(self, kind: str, produce: Any) -> Any:
+        self._det_seq += 1
+        key = f"__det__:{kind}:{self._det_seq}"
+        if key in self._step_journal:
+            return self._step_journal[key]
+        with suppressed():
+            value = produce()
+        self._step_journal[key] = value
+        if self._step_commit is not None:
+            self._step_commit(key, value)
+        return value
+
     def now(self) -> float:
-        return time.time()
+        """Wall clock, journaled: replays return the original timestamp."""
+        return self._journaled("now", real_time)
 
     def uuid(self) -> str:
-        return str(_uuid.UUID(int=self._rng.getrandbits(128), version=4))
+        """A UUID, journaled so a replay produces the same id."""
+        return self._journaled(
+            "uuid",
+            lambda: str(_uuid.UUID(int=self._rng.getrandbits(128), version=4)))
 
     def random(self) -> float:
-        return self._rng.random()
+        """A random float, journaled so a replay produces the same value."""
+        return self._journaled("random", self._rng.random)
 
     # -- deadline / budget --------------------------------------------------
     @property
