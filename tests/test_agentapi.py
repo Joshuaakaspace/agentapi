@@ -971,3 +971,189 @@ async def test_replay_divergence_is_detected(tmp_path):
     terminal = run2.log.read(0)[-1]
     assert terminal.kind == "nondeterminism"
     assert "diverged" in terminal.error
+
+
+# --- drain policy ---------------------------------------------------------
+
+async def test_drain_finishes_current_step_then_stops():
+    app = AgentAPI(llm=MockLLM())
+    progress = []
+    in_step = asyncio.Event()
+    let_step_finish = asyncio.Event()
+
+    @step
+    async def slow_step():
+        in_step.set()
+        await let_step_finish.wait()
+        progress.append("step-finished")
+        return "done-work"
+
+    @app.run("/drainable", on_disconnect="drain")
+    async def drainable():
+        yield Token(text="start")
+        await slow_step()
+        progress.append("after-step")
+        yield Token(text="more")          # drain stops the run here
+        progress.append("emitted-more")   # unreachable
+        yield Done(result="full")
+
+    async with live_app(app) as client:
+        async with client.stream("POST", "/drainable", json={}) as response:
+            run_id = response.headers["x-run-id"]
+            async for _ in response.aiter_lines():
+                break
+            await asyncio.wait_for(in_step.wait(), timeout=2)
+        await asyncio.sleep(0.05)          # disconnect registered -> drain
+        let_step_finish.set()
+        run = app.runs.get(run_id)
+        await asyncio.wait_for(run.task, timeout=2)
+
+    # The in-flight step ran to completion rather than being interrupted,
+    # and the run then stopped at the next checkpoint (the emit) — so no
+    # further output reached the log.
+    assert progress == ["step-finished", "after-step"]
+    assert "emitted-more" not in progress
+    assert run.status.value == "completed"  # graceful stop, not an error
+    assert [e.type for e in run.log.read(0)] == ["token", "done"]
+
+
+async def test_ctx_draining_flag_visible_to_handlers():
+    app = AgentAPI(llm=MockLLM())
+    seen = {}
+
+    @app.run("/loop", on_disconnect="drain")
+    async def looper():
+        for i in range(100):
+            if ctx.draining:               # handler-controlled early exit
+                seen["stopped_at"] = i
+                break
+            yield Token(text=str(i))
+            await asyncio.sleep(0.01)
+        yield Done(result=seen.get("stopped_at"))
+
+    async with live_app(app) as client:
+        async with client.stream("POST", "/loop", json={}) as response:
+            run_id = response.headers["x-run-id"]
+            async for _ in response.aiter_lines():
+                break
+        run = app.runs.get(run_id)
+        await asyncio.wait_for(run.task, timeout=3)
+    assert 0 < seen["stopped_at"] < 100
+
+
+# --- pool fair queueing and adaptive capacity -----------------------------
+
+async def test_pool_fair_queueing_across_tenants():
+    """One tenant flooding the queue must not starve another."""
+    from agentapi.pools import Pool
+    pool = Pool("shared", concurrency=1)
+    order = []
+
+    async def work(tenant, tag):
+        async with pool.acquire(tenant=tenant):
+            order.append(tag)
+            await asyncio.sleep(0.01)
+
+    async with pool.acquire(tenant="hold"):          # occupy the only slot
+        tasks = [asyncio.create_task(work("noisy", f"noisy{i}"))
+                 for i in range(5)]
+        await asyncio.sleep(0.01)
+        tasks.append(asyncio.create_task(work("quiet", "quiet0")))
+        await asyncio.sleep(0.01)
+    await asyncio.gather(*tasks)
+
+    # round robin: the quiet tenant is served second, not after all 5
+    assert order.index("quiet0") == 1, order
+
+
+async def test_pool_adapts_capacity_to_upstream_429():
+    from agentapi.pools import Pool
+    pool = Pool("adaptive", concurrency=8, recovery_after_s=0.0)
+    assert pool.effective_concurrency == 8
+
+    pool.report_upstream_429(retry_after=0.0)
+    assert pool.effective_concurrency == 4          # multiplicative decrease
+    pool.report_upstream_429(retry_after=0.0)
+    assert pool.effective_concurrency == 2
+    assert pool.stats()["effective_concurrency"] == 2
+
+    for _ in range(10):                              # additive increase back
+        pool.report_success()
+    assert pool.effective_concurrency > 2
+
+
+async def test_llm_429_shrinks_the_pool():
+    """A provider 429 during a real call feeds back into admission control."""
+    from agentapi.pools import Pool
+
+    class Boom(Exception):
+        def __init__(self):
+            self.response = type("R", (), {"status_code": 429,
+                                           "headers": {"retry-after": "0"}})()
+
+    class FailingLLM(MockLLM):
+        async def _complete(self, **kwargs):
+            raise Boom()
+
+    pool = Pool("upstream", concurrency=8, recovery_after_s=0.0)
+    app = AgentAPI(llm=FailingLLM(pool=pool))
+
+    @app.run("/hits429")
+    async def hits429():
+        await ctx.llm.complete(model="mock", messages=[
+            {"role": "user", "content": "x"}])
+        yield Done()
+
+    async with client_for(app) as client:
+        async with client.stream("POST", "/hits429", json={}) as response:
+            events = await sse_events(response)
+    assert events[-1]["event"] == "error"
+    assert pool.effective_concurrency == 4      # capacity shrank on the 429
+
+
+# --- OpenAI-compatible surface --------------------------------------------
+
+def openai_app():
+    app = AgentAPI(llm=MockLLM(script=["hello there friend"]))
+
+    @app.run("/chat")
+    async def chat(messages: list = None, model: str = "mock"):
+        async for tok in ctx.llm.stream(model=model, messages=messages or []):
+            yield Token(text=tok)
+        yield Done()
+
+    app.openai_compat("/chat")
+    return app
+
+
+async def test_openai_compat_non_streaming():
+    app = openai_app()
+    async with client_for(app) as client:
+        response = await client.post("/v1/chat/completions", json={
+            "model": "gpt-4o", "messages": [
+                {"role": "user", "content": "hi"}]})
+    body = response.json()
+    assert body["object"] == "chat.completion"
+    assert body["choices"][0]["message"]["content"].strip() == "hello there friend"
+    assert body["choices"][0]["finish_reason"] == "stop"
+    assert body["usage"]["completion_tokens"] == 3
+
+
+async def test_openai_compat_streaming_chunks():
+    app = openai_app()
+    async with live_app(app) as client:
+        async with client.stream("POST", "/v1/chat/completions", json={
+                "model": "gpt-4o", "stream": True,
+                "messages": [{"role": "user", "content": "hi"}]}) as response:
+            payloads = []
+            async for line in response.aiter_lines():
+                if line.startswith("data: "):
+                    payloads.append(line[6:])
+    assert payloads[-1] == "[DONE]"
+    chunks = [json.loads(p) for p in payloads[:-1]]
+    assert all(c["object"] == "chat.completion.chunk" for c in chunks)
+    text = "".join(c["choices"][0]["delta"].get("content", "") for c in chunks)
+    assert text.strip() == "hello there friend"
+    assert chunks[-1]["choices"][0]["finish_reason"] == "stop"
+
+

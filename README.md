@@ -44,9 +44,26 @@ curl -N localhost:8000/research -X POST \
 | The same function is hand-declared 3× (HTTP, LLM tool, MCP) | `@app.op` — one signature+docstring → HTTP route, Anthropic/OpenAI tool defs (`GET /llm/tools`), and an MCP server (`POST /mcp`) |
 | Expensive double-fired requests | `Idempotency-Key` honoured on run creation |
 | Observability bolted on per project | Lifecycle **hooks** (`on_run_start/on_event/on_run_end/on_tool_call/on_llm_call/...`); hook failures never kill a run |
+| Half-streamed JSON can't be validated | `ctx.llm.stream_as(Invoice, ...)` yields a `PartialModel` per delta — fields fill in as tokens arrive — with a bounded repair loop if it never validates |
 | Capabilities copy-pasted between services | **Skills**: instructions + ops + hooks in one mountable bundle, loadable from a `SKILL.md` directory; skill instructions become the agent loop's system prompt |
 | Every project rewrites the model↔tools loop | `await app.agent(model=..., messages=...)` — Anthropic-format tool loop over your ops; tool calls/results land in the event log, budgets and deadlines apply per turn |
 | Process crash loses hours of agent work | `AgentAPI(durable="runs.db")` + `durability="durable"` routes: SQLite journal of events, steps and signals; `app.recover()` replays unfinished runs — completed steps don't re-execute, past signals re-deliver, history isn't duplicated |
+
+## Performance vs FastAPI
+
+Measured, not asserted (`python benchmarks/bench.py`, full numbers in
+[BENCHMARKS.md](BENCHMARKS.md)):
+
+| Scenario | FastAPI | agentapi |
+|---|---|---|
+| JSON request/response | 396 req/s | 397 req/s — **tie** |
+| SSE streaming (40 events) | 237 req/s | 196 req/s — **FastAPI wins by ~17%** |
+| Client hangs up mid-stream | work is gone | run completes, 41 events replayable |
+
+The streaming gap is real: appending to a log, sequencing and serialising
+each event costs ~0.3 ms per event. That is the price of resumability, and
+it is 0.1%–0.01% of a real LLM turn. Routes that need none of it can opt out
+with `durability="ephemeral"`.
 
 ## Surfaces
 
@@ -54,12 +71,36 @@ curl -N localhost:8000/research -X POST \
 POST /{route}                  create a run (SSE stream; ?stream=false to block)
 GET  /runs/{id}                status + usage
 GET  /runs/{id}/events         resumable SSE (?from= cursor / Last-Event-ID)
+WS   /ws/runs/{id}             bidirectional: events out, signals/cancel in
 POST /runs/{id}/signals/{s}    deliver a human-in-the-loop signal
 POST /runs/{id}/cancel         cancel (interrupts in-flight awaits)
+POST /v1/chat/completions      OpenAI-compatible (app.openai_compat("/chat"))
 GET  /ops                      op catalog          GET /llm/tools   tool defs
 POST /mcp                      MCP server          GET /skills      skills
 GET  /pools                    admission stats     GET /healthz
 ```
+
+Already have a FastAPI service? Adopt per route instead of rewriting:
+
+```python
+app.mount("/legacy", existing_fastapi_app)
+```
+
+## Replay and eval
+
+The journal records every event, step result and LLM exchange, so a
+production run is already a reproducible test case:
+
+```bash
+agentapi runs   --app myapp:app          # list recorded runs
+agentapi show   run_abc --app myapp:app  # full event history
+agentapi replay run_abc --app myapp:app  # re-run offline against recorded
+                                         # LLM responses; reports divergence
+agentapi eval   cases.json --app myapp:app
+```
+
+`replay` never touches the provider — it feeds journaled responses back in,
+so regression-testing a prompt change against real traffic costs nothing.
 
 ## Durability tiers
 
@@ -99,16 +140,18 @@ Set the policy with `AgentAPI(determinism="raise" | "warn" | "off")`
 
 ## Status
 
-Working core with a 35-test suite: run lifecycle, resume-by-cursor,
-detach/cancel policies, budgets, deadlines, pause/signal, steps, all three
-op surfaces, the agent loop, hooks, skills, pools, crash recovery (incl.
-crash-mid-stream with no duplicated events), and determinism checking.
+Working core with a 50-test suite: run lifecycle, resume-by-cursor,
+detach/cancel/drain policies, budgets, deadlines, pause/signal, steps, all
+three op surfaces, the agent loop, hooks, skills, fair-queueing pools, crash
+recovery (incl. crash-mid-stream with no duplicated events), determinism
+checking, WebSocket and OpenAI-compatible transports, partial validation,
+and the replay CLI.
 
-Not built yet (designed in DESIGN.md): the `agentapi replay`/`eval` CLI,
-Postgres backend and journal group-commit, per-tenant fair queueing and
-adaptive rate limits in pools, `on_disconnect="drain"`, typed streaming
-output (`Partial[Model]`), session affinity / prefix-cache-aware routing,
-and an OpenAI-compatible `/v1/chat/completions` surface.
+Not built yet (designed in DESIGN.md): a Postgres journal backend (SQLite
+only today), session affinity / prefix-cache-aware routing, and
+authentication — `x-tenant-id` is trusted as sent, so put a real auth layer
+in front of it. `AnthropicLLM` is implemented but has not been exercised
+against the live API.
 
 ```bash
 pip install -e ".[dev]" && pytest

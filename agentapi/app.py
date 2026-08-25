@@ -27,15 +27,18 @@ Surfaces mounted automatically:
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import inspect
 import json
+import logging
 from typing import Any, Callable, Optional, get_type_hints
 
 from pydantic import BaseModel
 from starlette.applications import Starlette
 from starlette.requests import Request
 from starlette.responses import JSONResponse, Response, StreamingResponse
-from starlette.routing import Route
+from starlette.routing import Mount, Route, WebSocketRoute
+from starlette.websockets import WebSocket, WebSocketDisconnect
 
 from .context import RunContext, parse_duration
 from .determinism import MODES as DETERMINISM_MODES
@@ -86,6 +89,8 @@ class AgentAPI:
         self.skills = SkillSet()
         self.pools: dict[str, Pool] = {}
         self._run_routes: dict[str, _RunRoute] = {}
+        self._mounts: list[tuple[str, Any]] = []
+        self._openai_route: Optional[str] = None
         self._asgi: Optional[Starlette] = None
         self.mcp = MCPServer(title, self._McpOps(self), version)
         if llm is not None:
@@ -163,6 +168,23 @@ class AgentAPI:
         self.pools[name] = pool
         return pool
 
+    def mount(self, path: str, app: Any) -> None:
+        """Mount any ASGI app (a FastAPI instance, Starlette, WSGI adapter)
+        under ``path``. The migration path: adopt agentapi per route instead
+        of rewriting a service."""
+        self._mounts.append((path, app))
+        self._asgi = None            # rebuild on next access
+
+    def openai_compat(self, route: str) -> None:
+        """Expose a run route as OpenAI-compatible ``/v1/chat/completions``.
+
+        The handler must accept a ``messages`` argument. Every existing
+        OpenAI client then works against it unchanged — streaming included."""
+        if route not in self._run_routes:
+            raise ValueError(f"unknown run route {route!r}")
+        self._openai_route = route
+        self._asgi = None
+
     def include_skill(self, skill: Skill) -> Skill:
         self.skills.add(skill)
         self.hooks.merge(skill.hooks)
@@ -212,6 +234,27 @@ class AgentAPI:
                               durable=route.durability == "durable",
                               determinism=self.determinism)
         return run, True
+
+    # -- housekeeping --------------------------------------------------------
+    async def _gc_loop(self, interval_s: float = 60.0) -> None:
+        """Drop finished runs past the retention window. Without this the
+        in-memory run table is a slow leak on a long-lived server."""
+        while True:
+            await asyncio.sleep(interval_s)
+            try:
+                self.runs.gc()
+            except Exception:  # noqa: BLE001 - housekeeping never kills serving
+                logging.getLogger("agentapi").exception("run gc failed")
+
+    @contextlib.asynccontextmanager
+    async def _lifespan(self, _app: Any):
+        gc_task = asyncio.create_task(self._gc_loop())
+        try:
+            yield
+        finally:
+            gc_task.cancel()
+            if self.backend is not None:
+                self.backend.flush()
 
     # -- recovery (tier-2 durability) ---------------------------------------
     def recover(self) -> list[str]:
@@ -270,6 +313,10 @@ class AgentAPI:
                                     self._make_op_endpoint(op),
                                     methods=[method or "POST"]))
 
+        routes.append(WebSocketRoute("/ws/runs/{run_id}", self._ws_run))
+        if self._openai_route is not None:
+            routes.append(Route("/v1/chat/completions",
+                                self._post_openai, methods=["POST"]))
         routes += [
             Route("/runs/{run_id}", self._get_run, methods=["GET"]),
             Route("/runs/{run_id}/events", self._get_events, methods=["GET"]),
@@ -284,7 +331,8 @@ class AgentAPI:
             Route("/healthz", lambda r: JSONResponse({"ok": True}),
                   methods=["GET"]),
         ]
-        return Starlette(routes=routes)
+        routes += [Mount(path, app=app) for path, app in self._mounts]
+        return Starlette(routes=routes, lifespan=self._lifespan)
 
     def _make_run_endpoint(self, route: _RunRoute) -> Callable[..., Any]:
         async def endpoint(request: Request) -> Response:
@@ -355,14 +403,145 @@ class AgentAPI:
                 if not run.log.closed and run.attached == 0:
                     if on_disconnect == "cancel":
                         self.runs.cancel(run.id)
+                    elif on_disconnect == "drain":
+                        # Stop cleanly at the next step boundary: work
+                        # already in flight finishes and is journaled.
+                        self.runs.drain(run.id)
                     # "detach": run continues; client resumes via
                     # GET /runs/{id}/events?from=<Last-Event-ID + 1>.
-                    # "drain" is honoured by handlers via ctx.draining (future).
 
         return StreamingResponse(
             body(), status_code=status_code, media_type="text/event-stream",
             headers={"x-run-id": run.id, "cache-control": "no-cache",
                      "x-accel-buffering": "no"})
+
+    # -- transport: websocket ------------------------------------------------
+    async def _ws_run(self, websocket: WebSocket) -> None:
+        """Bidirectional attach: events stream out, signals come back in —
+        the natural transport for human-in-the-loop, where SSE would need a
+        second connection to answer."""
+        run_id = websocket.path_params["run_id"]
+        run = self.runs.get(run_id)
+        if run is None:
+            await websocket.close(code=4404)
+            return
+        await websocket.accept()
+        from_seq = int(websocket.query_params.get("from", 0))
+
+        async def pump() -> None:
+            async for event in run.events(from_seq):
+                await websocket.send_json(event.model_dump(by_alias=True))
+
+        pumping = asyncio.create_task(pump())
+        try:
+            while not pumping.done():
+                receive = asyncio.create_task(websocket.receive_json())
+                done, _ = await asyncio.wait(
+                    {receive, pumping}, return_when=asyncio.FIRST_COMPLETED)
+                if receive in done:
+                    try:
+                        message = receive.result()
+                    except (WebSocketDisconnect, RuntimeError, ValueError):
+                        break
+                    action = message.get("action")
+                    if action == "signal":
+                        self.runs.signal(run_id, message["signal"],
+                                         message.get("payload"))
+                    elif action == "cancel":
+                        self.runs.cancel(run_id)
+                    elif action == "drain":
+                        self.runs.drain(run_id)
+                else:
+                    receive.cancel()
+        except WebSocketDisconnect:
+            pass
+        finally:
+            pumping.cancel()
+            route = self._run_routes.get(run.route)
+            if (route and not run.log.closed and run.attached == 0):
+                if route.on_disconnect == "cancel":
+                    self.runs.cancel(run.id)
+                elif route.on_disconnect == "drain":
+                    self.runs.drain(run.id)
+            try:
+                await websocket.close()
+            except RuntimeError:
+                pass
+
+    # -- transport: OpenAI-compatible chat completions ------------------------
+    async def _post_openai(self, request: Request) -> Response:
+        route = self._run_routes[self._openai_route]
+        try:
+            body = await request.json()
+        except json.JSONDecodeError:
+            return JSONResponse({"error": {"message": "invalid JSON"}},
+                                status_code=400)
+        messages = body.get("messages") or []
+        wants_stream = bool(body.get("stream"))
+        kwargs: dict[str, Any] = {}
+        fields = route.args_model.model_fields
+        if "messages" in fields:
+            kwargs["messages"] = messages
+        elif "prompt" in fields:
+            kwargs["prompt"] = messages[-1].get("content", "") if messages else ""
+        for name in ("model", "temperature", "max_tokens"):
+            if name in fields and name in body:
+                kwargs[name] = body[name]
+
+        run, _ = self._start_run(route, kwargs,
+                                 tenant=request.headers.get("x-tenant-id"),
+                                 idempotency_key=request.headers.get(
+                                     "idempotency-key"))
+        model_name = body.get("model", "agentapi")
+        created = int(run.created_at)
+
+        if wants_stream:
+            async def chunks():
+                async for event in run.events(0):
+                    delta = None
+                    if event.type == "token":
+                        delta = {"content": event.text}
+                    elif event.type == "message":
+                        delta = {"content": str(event.content)}
+                    elif event.type in ("done", "error"):
+                        payload = {
+                            "id": run.id, "object": "chat.completion.chunk",
+                            "created": created, "model": model_name,
+                            "choices": [{"index": 0, "delta": {},
+                                         "finish_reason": (
+                                             "stop" if event.type == "done"
+                                             else "error")}]}
+                        yield f"data: {json.dumps(payload)}\n\n"
+                        yield "data: [DONE]\n\n"
+                        return
+                    if delta is None:
+                        continue
+                    payload = {"id": run.id, "object": "chat.completion.chunk",
+                               "created": created, "model": model_name,
+                               "choices": [{"index": 0, "delta": delta,
+                                            "finish_reason": None}]}
+                    yield f"data: {json.dumps(payload)}\n\n"
+
+            return StreamingResponse(chunks(), media_type="text/event-stream",
+                                     headers={"x-run-id": run.id,
+                                              "cache-control": "no-cache"})
+
+        if run.task is not None:
+            await asyncio.shield(run.task)
+        text = "".join(e.text for e in run.log.read(0) if e.type == "token")
+        if not text:
+            text = "".join(str(e.content) for e in run.log.read(0)
+                           if e.type == "message")
+        usage = run.ctx.usage
+        return JSONResponse({
+            "id": run.id, "object": "chat.completion", "created": created,
+            "model": model_name,
+            "choices": [{"index": 0, "finish_reason": "stop",
+                         "message": {"role": "assistant", "content": text}}],
+            "usage": {"prompt_tokens": usage.input_tokens,
+                      "completion_tokens": usage.output_tokens,
+                      "total_tokens": usage.input_tokens + usage.output_tokens},
+        }, headers={"x-run-id": run.id})
 
     # -- endpoints -----------------------------------------------------------
     async def _get_run(self, request: Request) -> Response:

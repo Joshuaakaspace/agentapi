@@ -52,23 +52,57 @@ CREATE TABLE IF NOT EXISTS signals (
     payload TEXT,
     PRIMARY KEY (run_id, idx)
 );
+CREATE TABLE IF NOT EXISTS llm_calls (
+    run_id TEXT NOT NULL,
+    idx INTEGER NOT NULL,
+    model TEXT NOT NULL,
+    request TEXT NOT NULL,
+    response TEXT NOT NULL,
+    PRIMARY KEY (run_id, idx)
+);
 """
 
 
 class SQLiteBackend:
-    def __init__(self, path: str = "agentapi.db") -> None:
+    def __init__(self, path: str = "agentapi.db", *,
+                 group_commit_s: float = 0.0) -> None:
         self.path = path
         self._lock = threading.Lock()
         self._conn = sqlite3.connect(path, check_same_thread=False)
         self._conn.execute("PRAGMA journal_mode=WAL")
+        if group_commit_s:
+            # Trade a bounded window of durability for far fewer fsyncs:
+            # WAL + NORMAL means a commit survives process death (only an
+            # OS-level crash can lose the tail).
+            self._conn.execute("PRAGMA synchronous=NORMAL")
         self._conn.executescript(_SCHEMA)
         self._conn.commit()
+        self.group_commit_s = group_commit_s
+        self._pending = 0
+        self._last_commit = time.monotonic()
 
     def _execute(self, sql: str, params: tuple = ()) -> sqlite3.Cursor:
         with self._lock:
             cursor = self._conn.execute(sql, params)
-            self._conn.commit()
+            if not self.group_commit_s:
+                self._conn.commit()
+            else:
+                self._pending += 1
+                now = time.monotonic()
+                if now - self._last_commit >= self.group_commit_s:
+                    self._conn.commit()
+                    self._pending = 0
+                    self._last_commit = now
             return cursor
+
+    def flush(self) -> None:
+        """Commit any group-commit backlog. Called on run completion so a
+        finished run is always durable regardless of the batching window."""
+        with self._lock:
+            if self._pending:
+                self._conn.commit()
+                self._pending = 0
+                self._last_commit = time.monotonic()
 
     # -- runs ----------------------------------------------------------------
     def create_run(self, run_id: str, route: str, kwargs: dict[str, Any], *,
@@ -137,6 +171,31 @@ class SQLiteBackend:
             (run_id,)).fetchall()
         return [(row[0], json.loads(row[1])) for row in rows]
 
+    # -- recorded LLM calls (for replay) ------------------------------------
+    def record_llm_call(self, run_id: str, model: str,
+                        request: dict[str, Any], response: dict[str, Any]) -> None:
+        row = self._execute(
+            "SELECT COALESCE(MAX(idx), -1) + 1 FROM llm_calls WHERE run_id=?",
+            (run_id,)).fetchone()
+        self._execute("INSERT INTO llm_calls VALUES (?,?,?,?,?)",
+                      (run_id, row[0], model,
+                       json.dumps(request, default=str),
+                       json.dumps(response, default=str)))
+
+    def llm_calls(self, run_id: str) -> list[dict[str, Any]]:
+        rows = self._execute(
+            "SELECT model, request, response FROM llm_calls WHERE run_id=?"
+            " ORDER BY idx", (run_id,)).fetchall()
+        return [{"model": r[0], "request": json.loads(r[1]),
+                 "response": json.loads(r[2])} for r in rows]
+
+    def all_runs(self, limit: int = 50) -> list[dict[str, Any]]:
+        rows = self._execute(
+            "SELECT id FROM runs ORDER BY created_at DESC LIMIT ?",
+            (limit,)).fetchall()
+        return [self.get_run(r[0]) for r in rows]
+
     def close(self) -> None:
+        self.flush()
         with self._lock:
             self._conn.close()

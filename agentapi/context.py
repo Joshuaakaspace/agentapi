@@ -34,6 +34,17 @@ class RunCancelled(Exception):
     """Raised inside a handler when the run is cancelled externally."""
 
 
+class RunDraining(Exception):
+    """Raised at the next step boundary when a run is asked to drain: stop
+    cleanly after finishing the work already in flight."""
+
+
+# Depth of nested @step frames on the current task. A draining run keeps
+# going while this is non-zero so it stops *between* steps, not mid-step.
+_step_depth: contextvars.ContextVar[int] = contextvars.ContextVar(
+    "agentapi_step_depth", default=0)
+
+
 @dataclass
 class Usage:
     """Accumulated metered usage for a run (and any scope within it)."""
@@ -117,12 +128,16 @@ class RunContext:
             max_tokens=math.inf if max_tokens is None else max_tokens,
         )
         self._cancelled = False
+        self._draining = False
         self._signals: dict[str, asyncio.Queue[Any]] = {}
         self._emit_cb = None          # wired by the runtime
         self._llm = None              # wired by the app (LLM client facade)
         self._step_journal: dict[str, Any] = {}
         self._step_commit = None      # durable backend hook, wired by the app
         self._det_seq = 0             # ordinal for journaled ctx.now/uuid/random
+        self._llm_record = None       # backend hook: persist an LLM call
+        self._llm_replay: list[Any] = []   # recorded calls to replay, in order
+        self._llm_replay_cursor = 0
         self._rng = _random.Random(run_id)  # deterministic per run
 
     # -- identity / determinism helpers ------------------------------------
@@ -162,12 +177,14 @@ class RunContext:
         return self._scope.deadline - time.monotonic()
 
     def check(self) -> None:
-        """Raise if the run is cancelled or out of time. Called by the
-        runtime around every event append, LLM call and tool call."""
+        """Raise if the run is cancelled, draining or out of time. Called by
+        the runtime around every event append, LLM call and tool call."""
         if self._cancelled:
             raise RunCancelled(f"run {self.run_id} was cancelled")
         if self.deadline_remaining <= 0:
             raise DeadlineExceeded(f"deadline exceeded for run {self.run_id}")
+        if self._draining and _step_depth.get() == 0:
+            raise RunDraining(f"run {self.run_id} is draining")
 
     @property
     def usage(self) -> Usage:
@@ -217,6 +234,17 @@ class RunContext:
     def cancelled(self) -> bool:
         return self._cancelled
 
+    # -- drain --------------------------------------------------------------
+    def drain(self) -> None:
+        """Ask the run to stop cleanly at the next step boundary."""
+        self._draining = True
+
+    @property
+    def draining(self) -> bool:
+        """True once a drain was requested. Handlers doing long loops can
+        check this to bail out early and emit a partial result."""
+        return self._draining
+
     # -- events -------------------------------------------------------------
     async def emit(self, event: Event) -> Event:
         """Emit an event into the run's log from anywhere (tools, hooks)."""
@@ -264,6 +292,20 @@ class RunContext:
         queue = self._signals.setdefault(signal, asyncio.Queue())
         queue.put_nowait(payload)
         return True
+
+    # -- recorded LLM calls (replay) ----------------------------------------
+    def next_recorded_llm_call(self) -> Optional[dict[str, Any]]:
+        """Return the next recorded LLM response when replaying, else None."""
+        if self._llm_replay_cursor >= len(self._llm_replay):
+            return None
+        call = self._llm_replay[self._llm_replay_cursor]
+        self._llm_replay_cursor += 1
+        return call
+
+    def record_llm_call(self, model: str, request: dict[str, Any],
+                        response: dict[str, Any]) -> None:
+        if self._llm_record is not None:
+            self._llm_record(model, request, response)
 
     @property
     def llm(self):

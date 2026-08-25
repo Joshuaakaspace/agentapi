@@ -14,7 +14,7 @@ from enum import Enum
 from typing import Any, AsyncIterator, Callable, Optional
 
 from .context import (DeadlineExceeded, BudgetExceeded, RunCancelled,
-                      RunContext, _current)
+                      RunDraining, RunContext, _current)
 from .determinism import NondeterminismError, guarding, real_time
 from .events import Done, Event, EventLog, Paused, Resumed, RunError
 
@@ -122,6 +122,9 @@ class RunManager:
                                    metadata=context.metadata)
             context._step_commit = (
                 lambda key, result: backend.save_step(run_id, key, result))
+            context._llm_record = (
+                lambda model, request, response:
+                backend.record_llm_call(run_id, model, request, response))
 
         # Replay dedupe: a recovering execution re-emits a subsequence of the
         # restored history. Match each emitted event forward against history
@@ -160,6 +163,14 @@ class RunManager:
         run.task = asyncio.create_task(
             self._execute(run, handler, kwargs, hooks), name=f"agentapi:{run_id}")
         return run
+
+    async def _finish(self, run: Run, event: Event) -> None:
+        """Append a terminal event directly, bypassing ctx.check() — the run
+        is already stopping, so cancellation/drain must not block the end."""
+        try:
+            await asyncio.shield(run.log.append(event))
+        except (RuntimeError, asyncio.CancelledError):
+            pass
 
     def _diverged(self, run: Run, emitted: Event, expected: Event) -> None:
         """A replayed run emitted an event its recorded history does not
@@ -219,6 +230,14 @@ class RunManager:
                 await run.ctx.emit(Done(result=_plain(result),
                                         usage=run.ctx.usage.as_dict()))
             run.status = RunStatus.COMPLETED
+        except RunDraining:
+            # Graceful stop: the client is gone and the route asked to drain.
+            # Whatever completed is a real result, so end on Done, not error.
+            guard_cm = _exit_guard(guard_cm)
+            if not run.log.closed:
+                await self._finish(run, Done(result=_plain(result),
+                                             usage=run.ctx.usage.as_dict()))
+            run.status = RunStatus.COMPLETED
         except NondeterminismError as exc:
             run.status = RunStatus.FAILED
             await self._fail(run, str(exc), kind="nondeterminism")
@@ -244,6 +263,7 @@ class RunManager:
             if getattr(run, "durable", False) and self.backend is not None:
                 self.backend.update_status(run.id, run.status.value,
                                            finished=True)
+                self.backend.flush()   # a finished run is always durable
             _current.reset(token)
             if hooks is not None:
                 await hooks.fire("on_run_end", run)
@@ -269,6 +289,15 @@ class RunManager:
             run.task.cancel()
         return True
 
+    def drain(self, run_id: str) -> bool:
+        """Ask a run to stop at its next step boundary."""
+        run = self.runs.get(run_id)
+        if run is None or run.status not in (RunStatus.QUEUED,
+                                             RunStatus.RUNNING):
+            return False
+        run.ctx.drain()
+        return True
+
     def signal(self, run_id: str, signal: str, payload: Any) -> bool:
         run = self.runs.get(run_id)
         if run is None:
@@ -287,6 +316,15 @@ class RunManager:
         self._idempotency = {k: v for k, v in self._idempotency.items()
                              if v in self.runs}
         return len(stale)
+
+
+def _exit_guard(guard_cm: Any) -> None:
+    if guard_cm is not None:
+        try:
+            guard_cm.__exit__(None, None, None)
+        except Exception:  # noqa: BLE001
+            pass
+    return None
 
 
 def _plain(value: Any) -> Any:

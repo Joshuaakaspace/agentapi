@@ -13,7 +13,7 @@ import json
 import hashlib
 from typing import Any, Callable, Optional, TypeVar
 
-from .context import get_ctx, parse_duration
+from .context import get_ctx, parse_duration, _step_depth
 from .determinism import suppressed
 
 F = TypeVar("F", bound=Callable[..., Any])
@@ -57,10 +57,16 @@ def step(fn: Optional[F] = None, *, retries: int = 0,
                 try:
                     # A step's result is journaled, so nondeterminism
                     # inside it is fine — that is the entire point of steps.
-                    with suppressed():
-                        coro = func(*args, **kwargs)
-                        result = (await asyncio.wait_for(coro, timeout_s)
-                                  if timeout_s else await coro)
+                    # The depth token also tells a draining run not to stop
+                    # mid-step: "drain" finishes the current step first.
+                    depth = _step_depth.set(_step_depth.get() + 1)
+                    try:
+                        with suppressed():
+                            coro = func(*args, **kwargs)
+                            result = (await asyncio.wait_for(coro, timeout_s)
+                                      if timeout_s else await coro)
+                    finally:
+                        _step_depth.reset(depth)
                     journal[key] = result
                     if context._step_commit is not None:
                         context._step_commit(key, result)

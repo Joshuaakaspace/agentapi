@@ -10,7 +10,9 @@ from .determinism import NondeterminismError
 from .events import (Done, Event, Message, Paused, Resumed, RunError,
                      StateDelta, Token, ToolCall, ToolResult)
 from .hooks import Hooks
+from .context import RunDraining
 from .llm import AnthropicLLM, BaseLLM, MockLLM
+from .partial import PartialModel, complete_json
 from .pools import Pool, PoolSaturated
 from .run import Run, RunManager, RunStatus
 from .skills import Skill
@@ -21,8 +23,8 @@ __version__ = "0.1.0"
 __all__ = [
     "AgentAPI", "AnthropicLLM", "BaseLLM", "BudgetExceeded",
     "DeadlineExceeded", "Done", "Event", "Hooks", "Message", "MockLLM",
-    "NondeterminismError", "Paused", "Pool", "PoolSaturated", "Resumed",
-    "Run", "RunCancelled",
+    "NondeterminismError", "PartialModel", "Paused", "Pool", "PoolSaturated",
+    "Resumed", "Run", "RunCancelled", "RunDraining", "complete_json",
     "RunContext", "RunError", "RunManager", "RunStatus", "Skill",
     "StateDelta", "Token", "ToolCall", "ToolResult", "ctx", "get_ctx",
     "step",
