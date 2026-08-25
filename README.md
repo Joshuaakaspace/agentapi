@@ -45,9 +45,31 @@ curl -N localhost:8000/research -X POST \
 | Expensive double-fired requests | `Idempotency-Key` honoured on run creation |
 | Observability bolted on per project | Lifecycle **hooks** (`on_run_start/on_event/on_run_end/on_tool_call/on_llm_call/...`); hook failures never kill a run |
 | Half-streamed JSON can't be validated | `ctx.llm.stream_as(Invoice, ...)` yields a `PartialModel` per delta — fields fill in as tokens arrive — with a bounded repair loop if it never validates |
+| `x-tenant-id` trusted as sent | Pluggable `@app.authenticator` → `Principal`; the principal's tenant is authoritative, every run records its owner, and run endpoints enforce it (404, not 403, so existence can't be probed) |
+| Conversations bounce between backends, losing the KV cache | `app.sessions([...])` — sticky session affinity plus prefix-cache-aware placement, with a measurable hit rate on `GET /sessions` |
+| Traces, prompt logs and the request live in three systems | `instrument(app)` — one OTEL span per run, children per step/tool/LLM call, all keyed by `agentapi.run_id`; prompts stay out unless you opt in |
 | Capabilities copy-pasted between services | **Skills**: instructions + ops + hooks in one mountable bundle, loadable from a `SKILL.md` directory; skill instructions become the agent loop's system prompt |
 | Every project rewrites the model↔tools loop | `await app.agent(model=..., messages=...)` — Anthropic-format tool loop over your ops; tool calls/results land in the event log, budgets and deadlines apply per turn |
 | Process crash loses hours of agent work | `AgentAPI(durable="runs.db")` + `durability="durable"` routes: SQLite journal of events, steps and signals; `app.recover()` replays unfinished runs — completed steps don't re-execute, past signals re-deliver, history isn't duplicated |
+
+## Authentication
+
+Without an authenticator the app is open — the same as FastAPI with no
+dependencies. Register one and tenancy is enforced everywhere:
+
+```python
+@app.authenticator
+async def authenticate(request):
+    record = await lookup(request.headers.get("authorization"))
+    return None if record is None else Principal(
+        id=record.user, tenant=record.org)
+```
+
+The principal's tenant **overrides** any client-sent header, runs record
+their owner at creation, idempotency keys are scoped per tenant, and another
+tenant asking about your run gets a 404 rather than a 403. Pass
+`require_auth=True` to turn "no authenticator registered" into a startup
+error instead of a silent hole.
 
 ## Performance vs FastAPI
 
@@ -77,7 +99,8 @@ POST /runs/{id}/cancel         cancel (interrupts in-flight awaits)
 POST /v1/chat/completions      OpenAI-compatible (app.openai_compat("/chat"))
 GET  /ops                      op catalog          GET /llm/tools   tool defs
 POST /mcp                      MCP server          GET /skills      skills
-GET  /pools                    admission stats     GET /healthz
+GET  /pools                    admission stats     GET /sessions    routing
+GET  /healthz
 ```
 
 Already have a FastAPI service? Adopt per route instead of rewriting:
@@ -108,7 +131,12 @@ so regression-testing a prompt change against real traffic costs nothing.
 |---|---|---|
 | `ephemeral` | nothing (classic request) | — |
 | `resumable` (default) | client disconnects, reattach, replay | in-memory event log |
-| `durable` | **process crashes**, deploys, long HITL pauses | SQLite journal (`AgentAPI(durable="runs.db")`) |
+| `durable` | **process crashes**, deploys, long HITL pauses | SQLite journal (`AgentAPI(durable="runs.db")`) or Postgres (`AgentAPI(durable="postgresql://...")`) |
+
+On Postgres several workers share one journal, so any worker can resume a
+run whose original process died. `claim_runs` makes that safe with an
+atomic `UPDATE ... RETURNING` behind a lease: two workers recovering at the
+same instant cannot both resume a run and double its side effects.
 
 Recovery is replay-based: `app.recover()` re-executes unfinished durable
 runs from the top — `@step` results return from the journal instead of
@@ -140,18 +168,21 @@ Set the policy with `AgentAPI(determinism="raise" | "warn" | "off")`
 
 ## Status
 
-Working core with a 50-test suite: run lifecycle, resume-by-cursor,
+Working core with a 69-test suite: run lifecycle, resume-by-cursor,
 detach/cancel/drain policies, budgets, deadlines, pause/signal, steps, all
 three op surfaces, the agent loop, hooks, skills, fair-queueing pools, crash
 recovery (incl. crash-mid-stream with no duplicated events), determinism
 checking, WebSocket and OpenAI-compatible transports, partial validation,
-and the replay CLI.
+the replay CLI, authentication and tenant isolation, a Postgres journal
+(exercised against a real server, including multi-worker claim), session
+affinity with prefix-cache routing, and OpenTelemetry tracing.
 
-Not built yet (designed in DESIGN.md): a Postgres journal backend (SQLite
-only today), session affinity / prefix-cache-aware routing, and
-authentication — `x-tenant-id` is trusted as sent, so put a real auth layer
-in front of it. `AnthropicLLM` is implemented but has not been exercised
-against the live API.
+Not built yet: rate limiting per principal, a secrets/PII redaction layer
+for the journal (it stores prompts and results verbatim), and horizontal
+event-log fanout across processes (Redis Streams) — today a run's live
+subscribers must be on the worker that owns it, though any worker can read
+a Postgres-journaled run's history. `AnthropicLLM` is implemented but has
+not been exercised against the live API.
 
 ```bash
 pip install -e ".[dev]" && pytest

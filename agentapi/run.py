@@ -48,6 +48,7 @@ class Run:
         self.created_at = real_time()
         self.finished_at: Optional[float] = None
         self.attached = 0            # live transport subscribers
+        self.owner: Optional[tuple[str, Optional[str]]] = None  # (id, tenant)
         self.task: Optional[asyncio.Task[None]] = None
         self._hooks: list[Any] = []
 
@@ -99,7 +100,8 @@ class RunManager:
               durable: bool = False,
               run_id: Optional[str] = None,
               replay_events: Optional[list[Event]] = None,
-              determinism: str = "off") -> Run:
+              determinism: str = "off",
+              owner: Optional[tuple] = None) -> Run:
         recovering = run_id is not None
         run_id = run_id or f"run_{uuid.uuid4().hex[:20]}"
         context = ctx or RunContext(run_id)
@@ -108,6 +110,7 @@ class RunManager:
         run = Run(run_id, route, context, log)
         run.durable = durable
         run.determinism = determinism if durable else "off"
+        run.owner = owner
         self.runs[run_id] = run
         if idempotency_key:
             self._idempotency[idempotency_key] = run_id

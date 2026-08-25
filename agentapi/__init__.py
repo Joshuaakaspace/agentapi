@@ -10,21 +10,26 @@ from .determinism import NondeterminismError
 from .events import (Done, Event, Message, Paused, Resumed, RunError,
                      StateDelta, Token, ToolCall, ToolResult)
 from .hooks import Hooks
+from .auth import ANONYMOUS, AuthError, Principal, bearer_tokens
 from .context import RunDraining
 from .llm import AnthropicLLM, BaseLLM, MockLLM
 from .partial import PartialModel, complete_json
 from .pools import Pool, PoolSaturated
 from .run import Run, RunManager, RunStatus
+from .sessions import Backend, Session, SessionRouter
 from .skills import Skill
 from .steps import step
+from .tracing import instrument
 
 __version__ = "0.1.0"
 
 __all__ = [
-    "AgentAPI", "AnthropicLLM", "BaseLLM", "BudgetExceeded",
+    "ANONYMOUS", "AgentAPI", "AnthropicLLM", "AuthError", "Backend",
+    "BaseLLM", "BudgetExceeded",
     "DeadlineExceeded", "Done", "Event", "Hooks", "Message", "MockLLM",
     "NondeterminismError", "PartialModel", "Paused", "Pool", "PoolSaturated",
-    "Resumed", "Run", "RunCancelled", "RunDraining", "complete_json",
+    "Principal", "Resumed", "Run", "RunCancelled", "RunDraining", "Session",
+    "SessionRouter", "bearer_tokens", "complete_json", "instrument",
     "RunContext", "RunError", "RunManager", "RunStatus", "Skill",
     "StateDelta", "Token", "ToolCall", "ToolResult", "ctx", "get_ctx",
     "step",
