@@ -38,8 +38,9 @@ from starlette.responses import JSONResponse, Response, StreamingResponse
 from starlette.routing import Route
 
 from .context import RunContext, parse_duration
-from .events import Event
+from .events import parse_event
 from .hooks import Hooks
+from .journal import SQLiteBackend
 from .llm import BaseLLM
 from .mcp import MCPServer
 from .ops import OpRegistry, _schema_from_signature
@@ -52,7 +53,7 @@ class _RunRoute:
     def __init__(self, path: str, handler: Callable[..., Any], *,
                  on_disconnect: str, deadline: Optional[float],
                  budget_usd: Optional[float], budget_tokens: Optional[int],
-                 pools: list[Pool]) -> None:
+                 pools: list[Pool], durability: str) -> None:
         self.path = path
         self.handler = handler
         self.on_disconnect = on_disconnect
@@ -60,17 +61,20 @@ class _RunRoute:
         self.budget_usd = budget_usd
         self.budget_tokens = budget_tokens
         self.pools = pools
+        self.durability = durability
         self.args_model, self.args_schema = _schema_from_signature(handler)
 
 
 class AgentAPI:
     def __init__(self, *, title: str = "agentapi", version: str = "0.1.0",
                  llm: Optional[BaseLLM] = None,
-                 retention_s: float = 3600.0) -> None:
+                 retention_s: float = 3600.0,
+                 durable: Optional[str] = None) -> None:
         self.title = title
         self.version = version
         self.llm = llm
-        self.runs = RunManager(retention_s=retention_s)
+        self.backend = SQLiteBackend(durable) if durable else None
+        self.runs = RunManager(retention_s=retention_s, backend=self.backend)
         self.ops = OpRegistry()
         self.hooks = Hooks()
         self.skills = SkillSet()
@@ -107,12 +111,18 @@ class AgentAPI:
             deadline: Optional[str | float] = None,
             budget_usd: Optional[float] = None,
             budget_tokens: Optional[int] = None,
-            pools: Optional[list[Pool]] = None) -> Callable[[Callable], Callable]:
+            pools: Optional[list[Pool]] = None,
+            durability: str = "resumable") -> Callable[[Callable], Callable]:
         """Register a run handler. The handler is an async generator yielding
         Events (streaming) or a coroutine returning a result (request/response
         over the same run machinery)."""
         if on_disconnect not in ("detach", "cancel", "drain"):
             raise ValueError("on_disconnect must be detach|cancel|drain")
+        if durability not in ("ephemeral", "resumable", "durable"):
+            raise ValueError("durability must be ephemeral|resumable|durable")
+        if durability == "durable" and self.backend is None:
+            raise ValueError(
+                'durability="durable" requires AgentAPI(durable="path.db")')
 
         def decorate(fn: Callable[..., Any]) -> Callable[..., Any]:
             self._run_routes[path] = _RunRoute(
@@ -120,7 +130,7 @@ class AgentAPI:
                 on_disconnect=on_disconnect,
                 deadline=None if deadline is None else parse_duration(deadline),
                 budget_usd=budget_usd, budget_tokens=budget_tokens,
-                pools=pools or [])
+                pools=pools or [], durability=durability)
             return fn
         return decorate
 
@@ -159,12 +169,24 @@ class AgentAPI:
             tools.extend(skill.ops.llm_tools(style))
         return tools
 
-    async def call_op(self, name: str, arguments: dict[str, Any]) -> Any:
+    async def call_op(self, name: str, arguments: dict[str, Any],
+                      call_id: Optional[str] = None) -> Any:
         """Dispatch a model-issued tool call by name (agent loop helper)."""
         op = self.mcp.ops.get(name)
         if op is None:
             raise ValueError(f"unknown op: {name}")
-        return await op.call(arguments, hooks=self.hooks)
+        return await op.call(arguments, hooks=self.hooks, call_id=call_id)
+
+    async def agent(self, *, model: str, messages: list[dict[str, Any]],
+                    system: Optional[str] = None,
+                    tools: Optional[list[str]] = None,
+                    max_turns: int = 10, **params: Any) -> dict[str, Any]:
+        """Run an LLM tool loop against this app's ops inside the current
+        run. See agentapi.agent.agent_loop."""
+        from .agent import agent_loop
+        return await agent_loop(self, model=model, messages=messages,
+                                system=system, tools=tools,
+                                max_turns=max_turns, **params)
 
     # -- run creation (shared by all transports) -----------------------------
     def _start_run(self, route: _RunRoute, kwargs: dict[str, Any], *,
@@ -180,8 +202,40 @@ class AgentAPI:
         context._llm = self.llm
         run = self.runs.start(route.path, route.handler, kwargs,
                               ctx=context, idempotency_key=idempotency_key,
-                              hooks=self.hooks)
+                              hooks=self.hooks,
+                              durable=route.durability == "durable")
         return run, True
+
+    # -- recovery (tier-2 durability) ---------------------------------------
+    def recover(self) -> list[str]:
+        """Restart every unfinished durable run from the journal. Call once
+        at process start (e.g. in a lifespan handler). Completed steps
+        return journaled results, past signals re-deliver the same payloads,
+        and re-emitted history is deduplicated — so side effects run once
+        and the event log continues where it left off."""
+        if self.backend is None:
+            return []
+        recovered: list[str] = []
+        for row in self.backend.unfinished_runs():
+            route = self._run_routes.get(row["route"])
+            if route is None or row["id"] in self.runs.runs:
+                continue
+            context = RunContext(
+                row["id"], tenant=row["tenant"],
+                deadline_s=route.deadline,
+                max_usd=route.budget_usd, max_tokens=route.budget_tokens,
+                metadata=row["metadata"])
+            context._llm = self.llm
+            context._step_journal = self.backend.steps(row["id"])
+            for name, payload in self.backend.signals(row["id"]):
+                context.deliver_signal(name, payload)
+            replay_events = [parse_event(e)
+                             for e in self.backend.events(row["id"])]
+            self.runs.start(route.path, route.handler, row["kwargs"],
+                            ctx=context, hooks=self.hooks, durable=True,
+                            run_id=row["id"], replay_events=replay_events)
+            recovered.append(row["id"])
+        return recovered
 
     # -- ASGI ---------------------------------------------------------------
     @property
@@ -304,14 +358,27 @@ class AgentAPI:
 
     # -- endpoints -----------------------------------------------------------
     async def _get_run(self, request: Request) -> Response:
-        run = self.runs.get(request.path_params["run_id"])
+        run_id = request.path_params["run_id"]
+        run = self.runs.get(run_id)
         if run is None:
+            if self.backend is not None:
+                row = self.backend.get_run(run_id)
+                if row is not None:
+                    row["archived"] = True
+                    return JSONResponse(row)
             return JSONResponse({"error": "run not found"}, status_code=404)
         return JSONResponse(run.describe())
 
     async def _get_events(self, request: Request) -> Response:
         run = self.runs.get(request.path_params["run_id"])
         if run is None:
+            if self.backend is not None:
+                stored = self.backend.events(request.path_params["run_id"])
+                if stored:
+                    from_seq = int(request.query_params.get("from", 0))
+                    return JSONResponse({"events": stored[from_seq:],
+                                         "next": len(stored), "closed": True,
+                                         "archived": True})
             return JSONResponse({"error": "run not found"}, status_code=404)
         last_event_id = request.headers.get("last-event-id")
         from_seq = int(request.query_params.get(

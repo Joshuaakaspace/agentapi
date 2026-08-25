@@ -548,3 +548,234 @@ async def test_pools_endpoint_reports_stats():
         stats = (await client.get("/pools")).json()["pools"]
     assert stats[0]["name"] == "backend"
     assert stats[0]["in_flight"] == 0
+
+
+# --- agent loop -----------------------------------------------------------
+
+async def test_agent_loop_dispatches_tools_and_finishes():
+    app = AgentAPI(llm=MockLLM(script=[
+        {"text": "Let me search.",
+         "tool_use": [{"name": "search", "input": {"q": "cats", "limit": 1}}]},
+        "Cats are documented in [cats-0].",
+    ]))
+
+    @app.op
+    async def search(q: str, limit: int = 3) -> list[str]:
+        """Search the corpus."""
+        return [f"{q}-{i}" for i in range(limit)]
+
+    @app.run("/agent")
+    async def agent(task: str):
+        result = await app.agent(model="mock", messages=[
+            {"role": "user", "content": task}], max_turns=5)
+        yield Done(result=result)
+
+    async with client_for(app) as client:
+        async with client.stream("POST", "/agent",
+                                 json={"task": "find cats"}) as response:
+            events = await sse_events(response)
+    types = [e["event"] for e in events]
+    assert types == ["message", "tool_call", "tool_result", "message", "done"]
+    assert events[1]["data"]["name"] == "search"
+    assert events[2]["data"]["result"] == ["cats-0"]
+    result = events[-1]["data"]["result"]
+    assert result["turns"] == 2
+    assert "cats-0" in result["text"]
+    assert events[-1]["data"]["usage"]["llm_calls"] == 2
+    assert events[-1]["data"]["usage"]["tool_calls"] == 1
+
+
+async def test_agent_loop_tool_error_is_fed_back_to_model():
+    app = AgentAPI(llm=MockLLM(script=[
+        {"tool_use": [{"name": "explode", "input": {}}]},
+        "The tool failed, moving on.",
+    ]))
+
+    @app.op
+    async def explode() -> str:
+        raise RuntimeError("kaboom")
+
+    @app.run("/agent")
+    async def agent():
+        yield Done(result=await app.agent(model="mock", messages=[
+            {"role": "user", "content": "go"}]))
+
+    async with client_for(app) as client:
+        async with client.stream("POST", "/agent", json={}) as response:
+            events = await sse_events(response)
+    assert events[-1]["event"] == "done"                 # loop survived
+    tool_results = [e for e in events if e["event"] == "tool_result"]
+    assert "kaboom" in tool_results[0]["data"]["error"]
+    assert events[-1]["data"]["result"]["turns"] == 2
+
+
+async def test_agent_loop_skill_instructions_become_system_prompt():
+    captured = {}
+
+    class SpyLLM(MockLLM):
+        async def _complete(self, **kwargs):
+            captured.update(kwargs)
+            return await super()._complete(
+                model=kwargs["model"], messages=kwargs["messages"])
+
+    app = AgentAPI(llm=SpyLLM(script=["done"]))
+    skill = Skill("style", instructions="Answer tersely.")
+    app.include_skill(skill)
+
+    @app.run("/agent")
+    async def agent():
+        yield Done(result=await app.agent(model="mock", messages=[
+            {"role": "user", "content": "hi"}]))
+
+    async with client_for(app) as client:
+        async with client.stream("POST", "/agent", json={}) as response:
+            await sse_events(response)
+    assert "Answer tersely." in captured["system"]
+
+
+# --- tier-2 durability ----------------------------------------------------
+
+def durable_app(db_path, side_effects, llm_script=None, token_delay=0.0):
+    """Two 'processes' over the same journal are two AgentAPI instances."""
+    class DelayLLM(MockLLM):
+        async def _stream(self, **kwargs):
+            async for tok in super()._stream(**kwargs):
+                if token_delay:
+                    await asyncio.sleep(token_delay)
+                yield tok
+
+    app = AgentAPI(llm=DelayLLM(script=llm_script or ["summary text here"]),
+                   durable=str(db_path))
+
+    class Approval(BaseModel):
+        approved: bool
+
+    @step
+    async def expensive(topic: str) -> str:
+        side_effects.append(topic)
+        return f"gathered:{topic}"
+
+    @app.run("/pipeline", durability="durable")
+    async def pipeline(topic: str):
+        gathered = await expensive(topic)
+        yield StateDelta(data={"gathered": gathered})
+        approval = await ctx.pause("approval", schema=Approval, timeout="60s")
+        async for tok in ctx.llm.stream(model="mock", messages=[
+                {"role": "user", "content": gathered}]):
+            yield Token(text=tok)
+        yield Done(result={"approved": approval.approved})
+
+    return app
+
+
+async def test_durable_run_survives_process_death(tmp_path):
+    db = tmp_path / "runs.db"
+    side_effects = []
+
+    # -- process 1: run reaches the pause, then the process "dies" ----------
+    app1 = durable_app(db, side_effects)
+    async with live_app(app1) as client:
+        async with client.stream("POST", "/pipeline",
+                                 json={"topic": "kv"},
+                                 timeout=2) as response:
+            run_id = response.headers["x-run-id"]
+            async for line in response.aiter_lines():
+                if line.startswith("event: paused"):
+                    break
+    run1 = app1.runs.get(run_id)
+    run1.durable = False   # a real crash persists nothing on the way down
+    run1.task.cancel()
+    try:
+        await run1.task
+    except (asyncio.CancelledError, Exception):
+        pass
+    assert side_effects == ["kv"]
+    assert app1.backend.get_run(run_id)["status"] in ("paused", "running")
+
+    # -- process 2: fresh instance over the same journal --------------------
+    app2 = durable_app(db, side_effects)
+    recovered = app2.recover()
+    assert recovered == [run_id]
+    await asyncio.sleep(0.05)
+    run2 = app2.runs.get(run_id)
+    assert run2.status.value == "paused"     # replayed back to the pause
+    assert side_effects == ["kv"]            # step did NOT re-execute
+
+    app2.runs.signal(run_id, "approval", {"approved": True})
+    await asyncio.wait_for(run2.task, timeout=2)
+    assert run2.status.value == "completed"
+
+    types = [e.type for e in run2.log.read(0)]
+    assert types[0] == "state_delta"         # history continued, not duplicated
+    assert types.count("state_delta") == 1
+    assert types.count("paused") == 1
+    assert types[-1] == "done"
+    assert app2.backend.get_run(run_id)["status"] == "completed"
+
+
+async def test_durable_signal_before_crash_replays_identically(tmp_path):
+    db = tmp_path / "runs.db"
+    side_effects = []
+
+    app1 = durable_app(db, side_effects, llm_script=["one two three four"],
+                       token_delay=0.2)
+    async with live_app(app1) as client:
+        async with client.stream("POST", "/pipeline",
+                                 json={"topic": "x"}, timeout=2) as response:
+            run_id = response.headers["x-run-id"]
+            async for line in response.aiter_lines():
+                if line.startswith("event: paused"):
+                    break
+    # approval arrives, a token or two streams, THEN the process dies
+    app1.runs.signal(run_id, "approval", {"approved": True})
+    await asyncio.sleep(0.3)
+    run1 = app1.runs.get(run_id)
+    events_before_crash = len(run1.log.read(0))
+    assert events_before_crash >= 3          # state_delta, paused, resumed...
+    run1.durable = False   # abrupt death: no terminal status reaches the DB
+    run1.task.cancel()
+    try:
+        await run1.task
+    except (asyncio.CancelledError, Exception):
+        pass
+
+    app2 = durable_app(db, side_effects, llm_script=["one two three four"])
+    app2.recover()
+    run2 = app2.runs.get(run_id)
+    await asyncio.wait_for(run2.task, timeout=2)
+    # every pre-crash event survived and the stream completed exactly once
+    texts = [e.text for e in run2.log.read(0) if e.type == "token"]
+    assert "".join(texts).strip() == "one two three four"
+    assert run2.status.value == "completed"
+    types = [e.type for e in run2.log.read(0)]
+    # the pre-crash signal was journaled: the replayed pause resumed with the
+    # same payload without any new POST
+    assert types.count("paused") == 1 and types.count("resumed") == 1
+    assert side_effects == ["x"]
+    assert types[-1] == "done"
+
+
+async def test_archived_run_readable_from_journal_after_restart(tmp_path):
+    db = tmp_path / "runs.db"
+    app1 = durable_app(db, [])
+    async with live_app(app1) as client:
+        async with client.stream("POST", "/pipeline",
+                                 json={"topic": "y"}, timeout=2) as response:
+            run_id = response.headers["x-run-id"]
+            async for line in response.aiter_lines():
+                if line.startswith("event: paused"):
+                    break
+        app1.runs.signal(run_id, "approval", {"approved": True})
+        run1 = app1.runs.get(run_id)
+        await asyncio.wait_for(run1.task, timeout=2)
+
+    # fresh instance, no recovery needed (run finished) — history still there
+    app2 = durable_app(db, [])
+    assert app2.recover() == []
+    async with client_for(app2) as client:
+        info = (await client.get(f"/runs/{run_id}")).json()
+        events = (await client.get(
+            f"/runs/{run_id}/events?stream=false")).json()
+    assert info["archived"] is True and info["status"] == "completed"
+    assert events["closed"] is True
+    assert [e["type"] for e in events["events"]][-1] == "done"

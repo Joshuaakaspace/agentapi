@@ -15,7 +15,16 @@ from typing import Any, AsyncIterator, Callable, Optional
 
 from .context import (DeadlineExceeded, BudgetExceeded, RunCancelled,
                       RunContext, _current)
-from .events import Done, Event, EventLog, RunError
+from .events import Done, Event, EventLog, Paused, Resumed, RunError
+
+
+def _event_fingerprint(event: Event) -> str:
+    """Identity of an event ignoring log-assigned seq/ts, for replay dedupe."""
+    payload = event.model_dump(by_alias=True)
+    payload.pop("seq", None)
+    payload.pop("ts", None)
+    import json as _json
+    return _json.dumps(payload, sort_keys=True, default=str)
 
 
 class RunStatus(str, Enum):
@@ -67,11 +76,12 @@ class Run:
 class RunManager:
     """Owns every run in the process. Runs outlive connections."""
 
-    def __init__(self, *, retention_s: float = 3600.0) -> None:
+    def __init__(self, *, retention_s: float = 3600.0,
+                 backend: Any = None) -> None:
         self.runs: dict[str, Run] = {}
         self._idempotency: dict[str, str] = {}   # Idempotency-Key -> run_id
         self.retention_s = retention_s
-        self._hooks = None                       # wired by the app
+        self.backend = backend                   # durable journal (tier 2)
 
     def get(self, run_id: str) -> Optional[Run]:
         return self.runs.get(run_id)
@@ -84,18 +94,55 @@ class RunManager:
               kwargs: dict[str, Any], *,
               ctx: RunContext | None = None,
               idempotency_key: Optional[str] = None,
-              hooks: Any = None) -> Run:
-        run_id = f"run_{uuid.uuid4().hex[:20]}"
+              hooks: Any = None,
+              durable: bool = False,
+              run_id: Optional[str] = None,
+              replay_events: Optional[list[Event]] = None) -> Run:
+        recovering = run_id is not None
+        run_id = run_id or f"run_{uuid.uuid4().hex[:20]}"
         context = ctx or RunContext(run_id)
         context.run_id = run_id
         log = EventLog()
         run = Run(run_id, route, context, log)
+        run.durable = durable
         self.runs[run_id] = run
         if idempotency_key:
             self._idempotency[idempotency_key] = run_id
 
+        backend = self.backend if durable else None
+        if backend is not None:
+            if recovering:
+                log.restore(replay_events or [])
+            else:
+                backend.create_run(run_id, route, kwargs,
+                                   tenant=context.tenant,
+                                   metadata=context.metadata)
+            context._step_commit = (
+                lambda key, result: backend.save_step(run_id, key, result))
+
+        # Replay dedupe: a recovering execution re-emits a subsequence of the
+        # restored history. Match each emitted event forward against history
+        # and return the recorded one instead of appending a duplicate.
+        replay = [(_event_fingerprint(e), e) for e in (replay_events or [])]
+        replay_cursor = [0]
+
         async def emit(event: Event) -> Event:
+            if replay_cursor[0] < len(replay):
+                fingerprint = _event_fingerprint(event)
+                for index in range(replay_cursor[0], len(replay)):
+                    if replay[index][0] == fingerprint:
+                        replay_cursor[0] = index + 1
+                        self._track_pause(run, replay[index][1])
+                        return replay[index][1]
             appended = await log.append(event)
+            self._track_pause(run, appended)
+            if backend is not None:
+                backend.append_event(run_id, appended.seq,
+                                     appended.model_dump(by_alias=True))
+                if isinstance(appended, Paused):
+                    backend.update_status(run_id, "paused")
+                elif isinstance(appended, Resumed):
+                    backend.update_status(run_id, "running")
             if hooks is not None:
                 await hooks.fire("on_event", run, appended)
             return appended
@@ -104,6 +151,12 @@ class RunManager:
         run.task = asyncio.create_task(
             self._execute(run, handler, kwargs, hooks), name=f"agentapi:{run_id}")
         return run
+
+    def _track_pause(self, run: Run, event: Event) -> None:
+        if event.type == "paused" and run.status == RunStatus.RUNNING:
+            run.status = RunStatus.PAUSED
+        elif event.type == "resumed" and run.status == RunStatus.PAUSED:
+            run.status = RunStatus.RUNNING
 
     async def _execute(self, run: Run, handler: Callable[..., Any],
                        kwargs: dict[str, Any], hooks: Any) -> None:
@@ -149,6 +202,9 @@ class RunManager:
             await self._fail(run, f"{type(exc).__name__}: {exc}", kind="error")
         finally:
             run.finished_at = time.time()
+            if getattr(run, "durable", False) and self.backend is not None:
+                self.backend.update_status(run.id, run.status.value,
+                                           finished=True)
             _current.reset(token)
             if hooks is not None:
                 await hooks.fire("on_run_end", run)
@@ -178,6 +234,8 @@ class RunManager:
         run = self.runs.get(run_id)
         if run is None:
             return False
+        if getattr(run, "durable", False) and self.backend is not None:
+            self.backend.append_signal(run_id, signal, payload)
         return run.ctx.deliver_signal(signal, payload)
 
     def gc(self) -> int:

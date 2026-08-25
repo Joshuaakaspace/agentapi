@@ -95,6 +95,24 @@ class RunError(Event):
 
 TERMINAL_TYPES = {"done", "error"}
 
+_EVENT_TYPES: dict[str, type[Event]] = {
+    "token": Token, "message": Message, "tool_call": ToolCall,
+    "tool_result": ToolResult, "state_delta": StateDelta, "paused": Paused,
+    "resumed": Resumed, "done": Done, "error": RunError,
+}
+
+
+class GenericEvent(Event):
+    """Round-trips unknown (user-defined) event types with fields intact."""
+    model_config = {"extra": "allow"}
+
+
+def parse_event(data: dict[str, Any]) -> Event:
+    """Deserialize a persisted event into its concrete class so replay
+    fingerprints and field access behave like the original."""
+    cls = _EVENT_TYPES.get(str(data.get("type", "")), GenericEvent)
+    return cls.model_validate(data)
+
 
 class EventLog:
     """Append-only, cursor-addressable event log for one run.
@@ -117,6 +135,12 @@ class EventLog:
     @property
     def closed(self) -> bool:
         return self._closed
+
+    def restore(self, events: list[Event]) -> None:
+        """Load persisted history (recovery). No subscribers exist yet, so
+        no notification is needed; a terminal event re-closes the log."""
+        self._events = list(events)
+        self._closed = any(e.type in TERMINAL_TYPES for e in self._events)
 
     async def append(self, event: Event) -> Event:
         if self._closed:

@@ -150,7 +150,11 @@ class AnthropicLLM(BaseLLM):
 
 class MockLLM(BaseLLM):
     """Deterministic provider for tests and examples: streams a canned
-    (or echo-derived) response token by token."""
+    (or echo-derived) response token by token.
+
+    Script entries may be strings (a text turn) or dicts describing a
+    tool-use turn: ``{"tool_use": [{"name": "search", "input": {...}}],
+    "text": "optional preamble"}``."""
 
     def __init__(self, script: Optional[list[str]] = None, **kwargs: Any) -> None:
         super().__init__(**kwargs)
@@ -159,20 +163,41 @@ class MockLLM(BaseLLM):
 
     def _next_text(self, messages: list[dict[str, Any]]) -> str:
         if self._cursor < len(self.script):
-            text = self.script[self._cursor]
+            entry = self.script[self._cursor]
             self._cursor += 1
-            return text
+            if isinstance(entry, dict):
+                return entry.get("text", "")
+            return entry
         last = messages[-1]["content"] if messages else ""
         return f"echo: {last}"
 
     async def _complete(self, *, model: str, messages: list[dict[str, Any]],
                         **params: Any) -> dict[str, Any]:
-        text = self._next_text(messages)
+        input_tokens = sum(len(str(m.get("content", "")).split())
+                           for m in messages)
+        entry: Any
+        if self._cursor < len(self.script):
+            entry = self.script[self._cursor]
+            self._cursor += 1
+        else:
+            entry = f"echo: {messages[-1]['content'] if messages else ''}"
+        if isinstance(entry, dict):
+            content: list[dict[str, Any]] = []
+            if entry.get("text"):
+                content.append({"type": "text", "text": entry["text"]})
+            for index, use in enumerate(entry.get("tool_use", [])):
+                content.append({"type": "tool_use",
+                                "id": f"toolu_mock_{self._cursor}_{index}",
+                                "name": use["name"],
+                                "input": use.get("input", {})})
+            return {"content": content, "stop_reason": "tool_use",
+                    "usage": {"input_tokens": input_tokens,
+                              "output_tokens": 10}}
         return {
-            "content": [{"type": "text", "text": text}],
-            "usage": {"input_tokens": sum(len(str(m.get('content', '')).split())
-                                          for m in messages),
-                      "output_tokens": len(text.split())},
+            "content": [{"type": "text", "text": entry}],
+            "stop_reason": "end_turn",
+            "usage": {"input_tokens": input_tokens,
+                      "output_tokens": len(entry.split())},
         }
 
     async def _stream(self, *, model: str, messages: list[dict[str, Any]],

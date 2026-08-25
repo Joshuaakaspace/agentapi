@@ -17,9 +17,6 @@ from .context import get_ctx, parse_duration
 
 F = TypeVar("F", bound=Callable[..., Any])
 
-# Per-run step journal: run_id -> {step_key: result}
-_journals: dict[str, dict[str, Any]] = {}
-
 
 def _step_key(name: str, args: tuple, kwargs: dict) -> str:
     try:
@@ -48,7 +45,7 @@ def step(fn: Optional[F] = None, *, retries: int = 0,
         @functools.wraps(func)
         async def wrapper(*args: Any, **kwargs: Any) -> Any:
             context = get_ctx()
-            journal = _journals.setdefault(context.run_id, {})
+            journal = context._step_journal
             key = _step_key(step_name, args, kwargs)
             if key in journal:
                 return journal[key]
@@ -61,6 +58,8 @@ def step(fn: Optional[F] = None, *, retries: int = 0,
                     result = (await asyncio.wait_for(coro, timeout_s)
                               if timeout_s else await coro)
                     journal[key] = result
+                    if context._step_commit is not None:
+                        context._step_commit(key, result)
                     return result
                 except (asyncio.CancelledError, KeyboardInterrupt):
                     raise
@@ -74,10 +73,3 @@ def step(fn: Optional[F] = None, *, retries: int = 0,
 
     return decorate if fn is None else decorate(fn)
 
-
-def journal_for(run_id: str) -> dict[str, Any]:
-    return _journals.get(run_id, {})
-
-
-def drop_journal(run_id: str) -> None:
-    _journals.pop(run_id, None)

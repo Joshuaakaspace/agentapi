@@ -44,7 +44,9 @@ curl -N localhost:8000/research -X POST \
 | The same function is hand-declared 3× (HTTP, LLM tool, MCP) | `@app.op` — one signature+docstring → HTTP route, Anthropic/OpenAI tool defs (`GET /llm/tools`), and an MCP server (`POST /mcp`) |
 | Expensive double-fired requests | `Idempotency-Key` honoured on run creation |
 | Observability bolted on per project | Lifecycle **hooks** (`on_run_start/on_event/on_run_end/on_tool_call/on_llm_call/...`); hook failures never kill a run |
-| Capabilities copy-pasted between services | **Skills**: instructions + ops + hooks in one mountable bundle, loadable from a `SKILL.md` directory |
+| Capabilities copy-pasted between services | **Skills**: instructions + ops + hooks in one mountable bundle, loadable from a `SKILL.md` directory; skill instructions become the agent loop's system prompt |
+| Every project rewrites the model↔tools loop | `await app.agent(model=..., messages=...)` — Anthropic-format tool loop over your ops; tool calls/results land in the event log, budgets and deadlines apply per turn |
+| Process crash loses hours of agent work | `AgentAPI(durable="runs.db")` + `durability="durable"` routes: SQLite journal of events, steps and signals; `app.recover()` replays unfinished runs — completed steps don't re-execute, past signals re-deliver, history isn't duplicated |
 
 ## Surfaces
 
@@ -59,13 +61,29 @@ POST /mcp                      MCP server          GET /skills      skills
 GET  /pools                    admission stats     GET /healthz
 ```
 
+## Durability tiers
+
+| `durability=` | Survives | Backing |
+|---|---|---|
+| `ephemeral` | nothing (classic request) | — |
+| `resumable` (default) | client disconnects, reattach, replay | in-memory event log |
+| `durable` | **process crashes**, deploys, long HITL pauses | SQLite journal (`AgentAPI(durable="runs.db")`) |
+
+Recovery is replay-based: `app.recover()` re-executes unfinished durable
+runs from the top — `@step` results return from the journal instead of
+re-running side effects, past signals re-deliver the same payloads, and
+re-emitted events are deduplicated against persisted history. Anything
+nondeterministic belongs in a `@step` or behind `ctx.now()/ctx.uuid()/
+ctx.random()`.
+
 ## Status
 
-Working core (durability tier 1, "resumable") with a full test suite:
-run lifecycle, resume-by-cursor, detach/cancel policies, budgets, deadlines,
-pause/signal, steps, all three op surfaces, hooks, skills, pools. Tier-2
-durable journals (Postgres), prefix-cache-aware routing, and replay/eval CLI
-are designed in DESIGN.md but not built yet.
+Working core with a 28-test suite: run lifecycle, resume-by-cursor,
+detach/cancel policies, budgets, deadlines, pause/signal, steps, all three
+op surfaces, the agent loop, hooks, skills, pools, and crash recovery
+(incl. crash-mid-stream with no duplicated events). Postgres backend,
+prefix-cache-aware routing, and the replay/eval CLI are designed in
+DESIGN.md but not built yet.
 
 ```bash
 pip install -e ".[dev]" && pytest

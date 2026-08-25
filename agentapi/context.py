@@ -119,6 +119,8 @@ class RunContext:
         self._signals: dict[str, asyncio.Queue[Any]] = {}
         self._emit_cb = None          # wired by the runtime
         self._llm = None              # wired by the app (LLM client facade)
+        self._step_journal: dict[str, Any] = {}
+        self._step_commit = None      # durable backend hook, wired by the app
         self._rng = _random.Random(run_id)  # deterministic per run
 
     # -- identity / determinism helpers ------------------------------------

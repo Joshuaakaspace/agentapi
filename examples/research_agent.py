@@ -21,8 +21,14 @@ from agentapi import (AgentAPI, Done, MockLLM, Skill, StateDelta, Token,
 llm = MockLLM(script=[
     "Event logs make streams resumable because every consumer is just a "
     "cursor over an append-only sequence.",
+    # scripted agent-loop turns for /agent below
+    {"text": "Searching first.",
+     "tool_use": [{"name": "search", "input": {"q": "durability"}}]},
+    "Based on the passages, durability means the run outlives the process.",
 ])
-app = AgentAPI(title="research-agent", llm=llm)
+# durable="research.db" turns on the tier-2 journal: durable routes survive
+# process crashes; call app.recover() at startup to resume them.
+app = AgentAPI(title="research-agent", llm=llm, durable="research.db")
 backend = app.pool("mock-backend", concurrency=8)
 
 
@@ -79,6 +85,17 @@ async def research(topic: str, require_approval: bool = False):
         yield Token(text=tok)
 
     yield Done(result={"topic": topic, "passages": len(passages)})
+
+
+# --- an agent loop: the model drives the ops -------------------------------
+@app.run("/agent", deadline="120s", budget_usd=1.00, durability="durable")
+async def agent(task: str):
+    result = await app.agent(model="claude-opus-5", messages=[
+        {"role": "user", "content": task}], max_turns=8)
+    yield Done(result=result)
+
+
+app.recover()   # resume any durable runs a previous process left unfinished
 
 
 # --- hooks: tracing without touching handlers --------------------------------
