@@ -31,9 +31,10 @@ import random
 import time
 import uuid
 import warnings
+from collections.abc import Callable
 from contextlib import contextmanager
 from contextvars import ContextVar
-from typing import Any, Callable, Optional
+from typing import Any
 
 logger = logging.getLogger("agentapi.determinism")
 
@@ -84,7 +85,7 @@ class _Guard:
                 self.depth -= 1
 
 
-_guard: ContextVar[Optional[_Guard]] = ContextVar("agentapi_determinism",
+_guard: ContextVar[_Guard | None] = ContextVar("agentapi_determinism",
                                                   default=None)
 
 # (module, attribute) pairs wrapped by install(). time.monotonic is
@@ -167,5 +168,5 @@ def suppressed():
         guard.depth -= 1
 
 
-def active_guard() -> Optional[_Guard]:
+def active_guard() -> _Guard | None:
     return _guard.get()

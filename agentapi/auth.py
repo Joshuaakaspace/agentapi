@@ -26,8 +26,9 @@ a silent hole.
 from __future__ import annotations
 
 import hmac
+from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
-from typing import Any, Awaitable, Callable, Optional
+from typing import Any
 
 
 @dataclass(frozen=True)
@@ -35,7 +36,7 @@ class Principal:
     """Who is making this request."""
 
     id: str
-    tenant: Optional[str] = None
+    tenant: str | None = None
     scopes: frozenset[str] = field(default_factory=frozenset)
     claims: dict[str, Any] = field(default_factory=dict)
 
@@ -49,7 +50,7 @@ class Principal:
 
 ANONYMOUS = Principal(id="anonymous")
 
-Authenticator = Callable[[Any], Awaitable[Optional[Principal]]]
+Authenticator = Callable[[Any], Awaitable[Principal | None]]
 
 
 class AuthError(Exception):
@@ -66,7 +67,7 @@ def bearer_tokens(tokens: dict[str, Principal]) -> Authenticator:
     Useful for internal services and tests. Comparison is constant-time so
     the map cannot be probed by timing.
     """
-    async def authenticate(request: Any) -> Optional[Principal]:
+    async def authenticate(request: Any) -> Principal | None:
         header = request.headers.get("authorization") or ""
         if not header.lower().startswith("bearer "):
             return None

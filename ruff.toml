@@ -1,0 +1,15 @@
+line-length = 88
+target-version = "py311"
+
+[lint]
+select = ["E", "F", "W", "I", "UP", "B", "SIM"]
+ignore = [
+    "E501",    # long lines: prose in docstrings reads better unwrapped
+    "B008",    # function calls in defaults are how decorators are declared here
+    "SIM105",  # contextlib.suppress is not clearer than a narrow try/except
+    "B017",    # tests deliberately assert on broad exceptions
+]
+
+[lint.per-file-ignores]
+"tests/*" = ["B011", "F841", "E402", "SIM117"]
+"benchmarks/*" = ["E402"]

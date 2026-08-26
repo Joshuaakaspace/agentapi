@@ -12,10 +12,10 @@ keeping whatever fields are already well-formed.
 from __future__ import annotations
 
 import json
-from typing import Any, Optional
+from typing import Any
 
 
-def complete_json(text: str) -> Optional[Any]:
+def complete_json(text: str) -> Any | None:
     """Parse possibly-truncated JSON by closing whatever is still open.
 
     Returns None if the fragment cannot be salvaged (e.g. nothing but a

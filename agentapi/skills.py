@@ -11,12 +11,12 @@ the on-disk convention used by Claude Code skills.
 """
 from __future__ import annotations
 
-import inspect
+from collections.abc import Callable
 from pathlib import Path
-from typing import Any, Callable, Optional
+from typing import Any
 
 from .hooks import Hooks
-from .ops import Op, OpRegistry
+from .ops import OpRegistry
 
 
 class Skill:
@@ -28,8 +28,8 @@ class Skill:
         self.ops = OpRegistry()
         self.hooks = Hooks()
 
-    def op(self, fn: Optional[Callable[..., Any]] = None, *,
-           name: Optional[str] = None, description: Optional[str] = None,
+    def op(self, fn: Callable[..., Any] | None = None, *,
+           name: str | None = None, description: str | None = None,
            llm_tool: bool = True, mcp: bool = True) -> Any:
         def decorate(func: Callable[..., Any]) -> Callable[..., Any]:
             self.ops.register(func, name=name, description=description,
@@ -52,7 +52,7 @@ class Skill:
         }
 
     @classmethod
-    def from_dir(cls, path: str | Path) -> "Skill":
+    def from_dir(cls, path: str | Path) -> Skill:
         """Load a skill from a directory containing SKILL.md.
 
         SKILL.md format (frontmatter-lite):
@@ -86,7 +86,7 @@ class SkillSet:
         self.skills[skill.name] = skill
         return skill
 
-    def get(self, name: str) -> Optional[Skill]:
+    def get(self, name: str) -> Skill | None:
         return self.skills.get(name)
 
     def all(self) -> list[Skill]:

@@ -20,7 +20,7 @@ import json
 import sqlite3
 import threading
 import time
-from typing import Any, Optional
+from typing import Any
 
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS runs (
@@ -106,7 +106,7 @@ class SQLiteBackend:
 
     # -- runs ----------------------------------------------------------------
     def create_run(self, run_id: str, route: str, kwargs: dict[str, Any], *,
-                   tenant: Optional[str], metadata: dict[str, Any]) -> None:
+                   tenant: str | None, metadata: dict[str, Any]) -> None:
         self._execute(
             "INSERT OR REPLACE INTO runs VALUES (?,?,?,?,?,?,?,NULL)",
             (run_id, route, json.dumps(kwargs, default=str), "running",
@@ -118,7 +118,7 @@ class SQLiteBackend:
             "UPDATE runs SET status=?, finished_at=? WHERE id=?",
             (status, time.time() if finished else None, run_id))
 
-    def get_run(self, run_id: str) -> Optional[dict[str, Any]]:
+    def get_run(self, run_id: str) -> dict[str, Any] | None:
         row = self._execute(
             "SELECT id, route, kwargs, status, tenant, metadata, created_at,"
             " finished_at FROM runs WHERE id=?", (run_id,)).fetchone()

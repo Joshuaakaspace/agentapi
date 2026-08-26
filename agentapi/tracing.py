@@ -16,7 +16,7 @@ observability dependency must never stop a server from serving.
 from __future__ import annotations
 
 import logging
-from typing import Any, Optional
+from typing import Any
 
 logger = logging.getLogger("agentapi.tracing")
 

@@ -10,11 +10,18 @@ import asyncio
 import inspect
 import time
 import uuid
-from enum import Enum
-from typing import Any, AsyncIterator, Callable, Optional
+from collections.abc import AsyncIterator, Callable
+from enum import StrEnum
+from typing import Any
 
-from .context import (DeadlineExceeded, BudgetExceeded, RunCancelled,
-                      RunDraining, RunContext, _current)
+from .context import (
+    BudgetExceeded,
+    DeadlineExceeded,
+    RunCancelled,
+    RunContext,
+    RunDraining,
+    _current,
+)
 from .determinism import NondeterminismError, guarding, real_time
 from .events import Done, Event, EventLog, Paused, Resumed, RunError
 
@@ -28,7 +35,7 @@ def _event_fingerprint(event: Event) -> str:
     return _json.dumps(payload, sort_keys=True, default=str)
 
 
-class RunStatus(str, Enum):
+class RunStatus(StrEnum):
     QUEUED = "queued"
     RUNNING = "running"
     PAUSED = "paused"
@@ -46,10 +53,10 @@ class Run:
         self.log = log
         self.status = RunStatus.QUEUED
         self.created_at = real_time()
-        self.finished_at: Optional[float] = None
+        self.finished_at: float | None = None
         self.attached = 0            # live transport subscribers
-        self.owner: Optional[tuple[str, Optional[str]]] = None  # (id, tenant)
-        self.task: Optional[asyncio.Task[None]] = None
+        self.owner: tuple[str, str | None] | None = None  # (id, tenant)
+        self.task: asyncio.Task[None] | None = None
         self._hooks: list[Any] = []
 
     def describe(self) -> dict[str, Any]:
@@ -79,29 +86,33 @@ class RunManager:
     """Owns every run in the process. Runs outlive connections."""
 
     def __init__(self, *, retention_s: float = 3600.0,
-                 backend: Any = None) -> None:
+                 backend: Any = None, redactor: Any = None,
+                 fanout: Any = None) -> None:
         self.runs: dict[str, Run] = {}
         self._idempotency: dict[str, str] = {}   # Idempotency-Key -> run_id
         self.retention_s = retention_s
         self.backend = backend                   # durable journal (tier 2)
+        from .redaction import NullRedactor
+        self.redactor = redactor or NullRedactor()
+        self.fanout = fanout                     # cross-worker mirror
 
-    def get(self, run_id: str) -> Optional[Run]:
+    def get(self, run_id: str) -> Run | None:
         return self.runs.get(run_id)
 
-    def by_idempotency_key(self, key: str) -> Optional[Run]:
+    def by_idempotency_key(self, key: str) -> Run | None:
         run_id = self._idempotency.get(key)
         return self.runs.get(run_id) if run_id else None
 
     def start(self, route: str, handler: Callable[..., Any],
               kwargs: dict[str, Any], *,
               ctx: RunContext | None = None,
-              idempotency_key: Optional[str] = None,
+              idempotency_key: str | None = None,
               hooks: Any = None,
               durable: bool = False,
-              run_id: Optional[str] = None,
-              replay_events: Optional[list[Event]] = None,
+              run_id: str | None = None,
+              replay_events: list[Event] | None = None,
               determinism: str = "off",
-              owner: Optional[tuple] = None) -> Run:
+              owner: tuple | None = None) -> Run:
         recovering = run_id is not None
         run_id = run_id or f"run_{uuid.uuid4().hex[:20]}"
         context = ctx or RunContext(run_id)
@@ -124,10 +135,17 @@ class RunManager:
                                    tenant=context.tenant,
                                    metadata=context.metadata)
             context._step_commit = (
-                lambda key, result: backend.save_step(run_id, key, result))
-            context._llm_record = (
-                lambda model, request, response:
-                backend.record_llm_call(run_id, model, request, response))
+                lambda key, result:
+                backend.save_step(run_id, key, self.redactor.step(result)))
+            redactor = self.redactor
+
+            def _record_llm(model, request, response):
+                clean_request, clean_response = redactor.llm_call(
+                    request, response)
+                backend.record_llm_call(run_id, model, clean_request,
+                                        clean_response)
+
+            context._llm_record = _record_llm
 
         # Replay dedupe: a recovering execution re-emits a subsequence of the
         # restored history. Match each emitted event forward against history
@@ -152,12 +170,18 @@ class RunManager:
             appended = await log.append(event)
             self._track_pause(run, appended)
             if backend is not None:
-                backend.append_event(run_id, appended.seq,
-                                     appended.model_dump(by_alias=True))
+                # Redact on the way in: what never reaches the journal
+                # cannot leak from it. Attached clients still see the real
+                # event — they are the caller who supplied the content.
+                backend.append_event(
+                    run_id, appended.seq,
+                    self.redactor.event(appended.model_dump(by_alias=True)))
                 if isinstance(appended, Paused):
                     backend.update_status(run_id, "paused")
                 elif isinstance(appended, Resumed):
                     backend.update_status(run_id, "running")
+            if self.fanout is not None:
+                await self.fanout.publish(run_id, appended)
             if hooks is not None:
                 await hooks.fire("on_event", run, appended)
             return appended

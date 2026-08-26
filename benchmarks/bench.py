@@ -23,7 +23,7 @@ from fastapi import FastAPI
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
 
-from agentapi import AgentAPI, Done, MockLLM, Token, ctx
+from agentapi import AgentAPI, Done, MockLLM, Token
 
 TOKENS = 40
 REQUESTS = 200
@@ -162,9 +162,9 @@ async def main() -> None:
 
         print("\nClient disconnects mid-stream — what happened to the work?")
         agent_outcome = await disconnect_survival(agent_base, "/durable-stream")
-        print(f"  FastAPI                      "
-              f"no run id, no way to ask: the generator was cancelled and "
-              f"the output is gone")
+        print("  FastAPI                      "
+              "no run id, no way to ask: the generator was cancelled and "
+              "the output is gone")
         print(f"  agentapi                     run is {agent_outcome[0]!r} "
               f"with {agent_outcome[1]} events still replayable")
     finally:

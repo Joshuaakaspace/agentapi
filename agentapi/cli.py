@@ -20,7 +20,7 @@ import asyncio
 import importlib
 import json
 import sys
-from typing import Any, Optional
+from typing import Any
 
 from .context import RunContext
 from .events import parse_event
@@ -115,7 +115,7 @@ async def _replay(app: Any, run_id: str) -> tuple[bool, list[str]]:
     run = manager.start(route.path, route.handler, row["kwargs"], ctx=context)
     try:
         await asyncio.wait_for(run.task, timeout=60)
-    except asyncio.TimeoutError:
+    except TimeoutError:
         return False, ["replay timed out after 60s"]
 
     produced = run.log.read(0)
@@ -148,7 +148,8 @@ def cmd_eval(args: argparse.Namespace) -> int:
                   "expect_result": {...}}]
     """
     app = _load_app(args.app)
-    cases = json.loads(open(args.dataset).read())
+    with open(args.dataset) as handle:
+        cases = json.load(handle)
     passed = failed = 0
     for index, case in enumerate(cases):
         route = app._run_routes.get(case["route"])
@@ -167,7 +168,7 @@ def cmd_eval(args: argparse.Namespace) -> int:
     return 1 if failed else 0
 
 
-async def _run_case(app: Any, route: Any, case: dict[str, Any]) -> Optional[str]:
+async def _run_case(app: Any, route: Any, case: dict[str, Any]) -> str | None:
     from .run import RunManager
     context = RunContext("eval")
     context._llm = app.llm
@@ -176,7 +177,7 @@ async def _run_case(app: Any, route: Any, case: dict[str, Any]) -> Optional[str]
                         ctx=context)
     try:
         await asyncio.wait_for(run.task, timeout=case.get("timeout", 60))
-    except asyncio.TimeoutError:
+    except TimeoutError:
         return "timed out"
     events = run.log.read(0)
     types = [e.type for e in events]
@@ -192,7 +193,7 @@ async def _run_case(app: Any, route: Any, case: dict[str, Any]) -> Optional[str]
     return None
 
 
-def main(argv: Optional[list[str]] = None) -> int:
+def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(prog="agentapi", description=__doc__)
     parser.add_argument("--app", default="app:app",
                         help="module:attribute of the AgentAPI instance")

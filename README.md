@@ -47,6 +47,9 @@ curl -N localhost:8000/research -X POST \
 | Half-streamed JSON can't be validated | `ctx.llm.stream_as(Invoice, ...)` yields a `PartialModel` per delta — fields fill in as tokens arrive — with a bounded repair loop if it never validates |
 | `x-tenant-id` trusted as sent | Pluggable `@app.authenticator` → `Principal`; the principal's tenant is authoritative, every run records its owner, and run endpoints enforce it (404, not 403, so existence can't be probed) |
 | Conversations bounce between backends, losing the KV cache | `app.sessions([...])` — sticky session affinity plus prefix-cache-aware placement, with a measurable hit rate on `GET /sessions` |
+| The journal stores prompts and secrets verbatim, forever | `redactor=Redactor()` masks secrets, PII and named fields **on the way into** the journal — the live stream is untouched, and redacted journals still recover |
+| One caller can exhaust the process | `rate_limit=RateLimit(per_minute=60)` — token bucket keyed by tenant (or principal), overridable per route, 429 with a computed `Retry-After` |
+| A run can only be tailed on the worker that owns it | `fanout="redis://..."` mirrors events to Redis Streams, so **any** worker serves the same resumable stream for **any** run |
 | Traces, prompt logs and the request live in three systems | `instrument(app)` — one OTEL span per run, children per step/tool/LLM call, all keyed by `agentapi.run_id`; prompts stay out unless you opt in |
 | Capabilities copy-pasted between services | **Skills**: instructions + ops + hooks in one mountable bundle, loadable from a `SKILL.md` directory; skill instructions become the agent loop's system prompt |
 | Every project rewrites the model↔tools loop | `await app.agent(model=..., messages=...)` — Anthropic-format tool loop over your ops; tool calls/results land in the event log, budgets and deadlines apply per turn |
@@ -168,21 +171,25 @@ Set the policy with `AgentAPI(determinism="raise" | "warn" | "off")`
 
 ## Status
 
-Working core with a 69-test suite: run lifecycle, resume-by-cursor,
+Working core with an 83-test suite: run lifecycle, resume-by-cursor,
 detach/cancel/drain policies, budgets, deadlines, pause/signal, steps, all
 three op surfaces, the agent loop, hooks, skills, fair-queueing pools, crash
 recovery (incl. crash-mid-stream with no duplicated events), determinism
 checking, WebSocket and OpenAI-compatible transports, partial validation,
 the replay CLI, authentication and tenant isolation, a Postgres journal
 (exercised against a real server, including multi-worker claim), session
-affinity with prefix-cache routing, and OpenTelemetry tracing.
+affinity with prefix-cache routing, OpenTelemetry tracing, journal
+redaction, per-principal rate limiting, and cross-worker event fanout.
+CI runs the suite on Python 3.11-3.13 against real Postgres and Redis
+services, plus ruff.
 
-Not built yet: rate limiting per principal, a secrets/PII redaction layer
-for the journal (it stores prompts and results verbatim), and horizontal
-event-log fanout across processes (Redis Streams) — today a run's live
-subscribers must be on the worker that owns it, though any worker can read
-a Postgres-journaled run's history. `AnthropicLLM` is implemented but has
-not been exercised against the live API.
+**`AnthropicLLM` has never been run against the live API.** Every test uses
+`MockLLM`, so the real provider path — SSE parsing, error handling, retries
+— is unverified. That is the largest remaining unknown in the project.
+
+Also not built: multi-region/replicated journals, a UI for browsing runs,
+and streaming tool-call deltas (tool calls are dispatched only once the
+model's turn completes).
 
 ```bash
 pip install -e ".[dev]" && pytest
