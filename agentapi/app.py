@@ -40,6 +40,7 @@ from starlette.responses import JSONResponse, Response, StreamingResponse
 from starlette.routing import Mount, Route, WebSocketRoute
 from starlette.websockets import WebSocket, WebSocketDisconnect
 
+from .auth import ANONYMOUS, AuthError, Authenticator, Principal, owns
 from .context import RunContext, parse_duration
 from .determinism import MODES as DETERMINISM_MODES
 from .events import parse_event
@@ -50,7 +51,28 @@ from .mcp import MCPServer
 from .ops import OpRegistry, _schema_from_signature
 from .pools import Pool, PoolSaturated
 from .run import RunManager, RunStatus
+from .sessions import SessionRouter
 from .skills import Skill, SkillSet
+
+
+def _make_backend(durable: Optional[str | Any]):
+    """``durable=`` accepts a SQLite path, a postgres:// DSN, or a
+    ready-made backend object."""
+    if durable is None:
+        return None
+    if not isinstance(durable, str):
+        return durable                       # caller supplied a backend
+    if durable.startswith(("postgres://", "postgresql://")):
+        from .postgres import PostgresBackend
+        return PostgresBackend(durable)
+    return SQLiteBackend(durable)
+
+
+def _auth_response(exc: AuthError) -> JSONResponse:
+    headers = ({"WWW-Authenticate": "Bearer"}
+               if exc.status_code == 401 else None)
+    return JSONResponse({"error": str(exc)}, status_code=exc.status_code,
+                        headers=headers)
 
 
 class _RunRoute:
@@ -74,20 +96,24 @@ class AgentAPI:
                  llm: Optional[BaseLLM] = None,
                  retention_s: float = 3600.0,
                  durable: Optional[str] = None,
-                 determinism: str = "raise") -> None:
+                 determinism: str = "raise",
+                 require_auth: bool = False) -> None:
         if determinism not in DETERMINISM_MODES:
             raise ValueError(
                 f"determinism must be one of {DETERMINISM_MODES}")
         self.determinism = determinism
+        self.require_auth = require_auth
+        self._authenticator: Optional[Authenticator] = None
         self.title = title
         self.version = version
         self.llm = llm
-        self.backend = SQLiteBackend(durable) if durable else None
+        self.backend = _make_backend(durable)
         self.runs = RunManager(retention_s=retention_s, backend=self.backend)
         self.ops = OpRegistry()
         self.hooks = Hooks()
         self.skills = SkillSet()
         self.pools: dict[str, Pool] = {}
+        self.router: Optional[SessionRouter] = None
         self._run_routes: dict[str, _RunRoute] = {}
         self._mounts: list[tuple[str, Any]] = []
         self._openai_route: Optional[str] = None
@@ -163,6 +189,33 @@ class AgentAPI:
             return func
         return decorate
 
+    def authenticator(self, fn: Authenticator) -> Authenticator:
+        """Register the function that turns a request into a Principal.
+
+        Returning None means "not authenticated" -> 401. The principal's
+        tenant is authoritative and overrides any client-sent header."""
+        self._authenticator = fn
+        return fn
+
+    async def _principal(self, request: Any) -> Principal:
+        """Resolve the caller. Raises AuthError for a rejected request."""
+        if self._authenticator is None:
+            if self.require_auth:
+                raise AuthError(
+                    "server requires authentication but no authenticator is "
+                    "registered", status_code=500)
+            return ANONYMOUS
+        principal = await self._authenticator(request)
+        if principal is None:
+            raise AuthError("invalid or missing credentials")
+        return principal
+
+    def _authorize_run(self, principal: Principal, run: Any) -> None:
+        if not owns(principal, run):
+            # 404, not 403: existence of another tenant's run is not
+            # something an unauthorised caller should be able to probe.
+            raise AuthError("run not found", status_code=404)
+
     def pool(self, name: str, **kwargs: Any) -> Pool:
         pool = Pool(name, **kwargs)
         self.pools[name] = pool
@@ -184,6 +237,12 @@ class AgentAPI:
             raise ValueError(f"unknown run route {route!r}")
         self._openai_route = route
         self._asgi = None
+
+    def sessions(self, backends: list, **kwargs: Any) -> SessionRouter:
+        """Enable sticky, prefix-cache-aware routing across ``backends``."""
+        self.router = SessionRouter(backends, **kwargs)
+        self._asgi = None
+        return self.router
 
     def include_skill(self, skill: Skill) -> Skill:
         self.skills.add(skill)
@@ -218,21 +277,26 @@ class AgentAPI:
 
     # -- run creation (shared by all transports) -----------------------------
     def _start_run(self, route: _RunRoute, kwargs: dict[str, Any], *,
-                   tenant: Optional[str], idempotency_key: Optional[str]):
+                   principal: Principal, idempotency_key: Optional[str]):
         if idempotency_key:
+            # Scope the key to the caller: two tenants using the same key
+            # must not collide, and one must never receive the other's run.
+            idempotency_key = f"{principal.tenant or principal.id}:{idempotency_key}"
             existing = self.runs.by_idempotency_key(idempotency_key)
             if existing is not None:
                 return existing, False
         context = RunContext(
-            "pending", tenant=tenant,
+            "pending", tenant=principal.tenant,
             deadline_s=route.deadline,
-            max_usd=route.budget_usd, max_tokens=route.budget_tokens)
+            max_usd=route.budget_usd, max_tokens=route.budget_tokens,
+            metadata={"principal": principal.id})
         context._llm = self.llm
         run = self.runs.start(route.path, route.handler, kwargs,
                               ctx=context, idempotency_key=idempotency_key,
                               hooks=self.hooks,
                               durable=route.durability == "durable",
-                              determinism=self.determinism)
+                              determinism=self.determinism,
+                              owner=(principal.id, principal.tenant))
         return run, True
 
     # -- housekeeping --------------------------------------------------------
@@ -243,6 +307,8 @@ class AgentAPI:
             await asyncio.sleep(interval_s)
             try:
                 self.runs.gc()
+                if self.router is not None:
+                    self.router.gc()
             except Exception:  # noqa: BLE001 - housekeeping never kills serving
                 logging.getLogger("agentapi").exception("run gc failed")
 
@@ -266,7 +332,9 @@ class AgentAPI:
         if self.backend is None:
             return []
         recovered: list[str] = []
-        for row in self.backend.unfinished_runs():
+        claim = getattr(self.backend, "claim_runs", None)
+        rows = claim() if claim is not None else self.backend.unfinished_runs()
+        for row in rows:
             route = self._run_routes.get(row["route"])
             if route is None or row["id"] in self.runs.runs:
                 continue
@@ -328,6 +396,7 @@ class AgentAPI:
             Route("/mcp", self._post_mcp, methods=["POST"]),
             Route("/skills", self._get_skills, methods=["GET"]),
             Route("/pools", self._get_pools, methods=["GET"]),
+            Route("/sessions", self._get_sessions, methods=["GET"]),
             Route("/healthz", lambda r: JSONResponse({"ok": True}),
                   methods=["GET"]),
         ]
@@ -336,6 +405,10 @@ class AgentAPI:
 
     def _make_run_endpoint(self, route: _RunRoute) -> Callable[..., Any]:
         async def endpoint(request: Request) -> Response:
+            try:
+                principal = await self._principal(request)
+            except AuthError as exc:
+                return _auth_response(exc)
             try:
                 body = await request.json() if await request.body() else {}
             except json.JSONDecodeError:
@@ -356,8 +429,7 @@ class AgentAPI:
                         headers={"Retry-After": str(int(estimated) + 1)})
 
             run, created = self._start_run(
-                route, kwargs,
-                tenant=request.headers.get("x-tenant-id"),
+                route, kwargs, principal=principal,
                 idempotency_key=request.headers.get("idempotency-key"))
 
             if request.query_params.get("stream") == "false":
@@ -373,6 +445,10 @@ class AgentAPI:
 
     def _make_op_endpoint(self, op: Any) -> Callable[..., Any]:
         async def endpoint(request: Request) -> Response:
+            try:
+                await self._principal(request)
+            except AuthError as exc:
+                return _auth_response(exc)
             try:
                 body = await request.json() if await request.body() else {}
             except json.JSONDecodeError:
@@ -421,8 +497,13 @@ class AgentAPI:
         the natural transport for human-in-the-loop, where SSE would need a
         second connection to answer."""
         run_id = websocket.path_params["run_id"]
+        try:
+            principal = await self._principal(websocket)
+        except AuthError:
+            await websocket.close(code=4401)
+            return
         run = self.runs.get(run_id)
-        if run is None:
+        if run is None or not owns(principal, run):
             await websocket.close(code=4404)
             return
         await websocket.accept()
@@ -472,6 +553,12 @@ class AgentAPI:
     async def _post_openai(self, request: Request) -> Response:
         route = self._run_routes[self._openai_route]
         try:
+            principal = await self._principal(request)
+        except AuthError as exc:
+            return JSONResponse(
+                {"error": {"message": str(exc), "type": "invalid_request_error"}},
+                status_code=exc.status_code)
+        try:
             body = await request.json()
         except json.JSONDecodeError:
             return JSONResponse({"error": {"message": "invalid JSON"}},
@@ -488,8 +575,7 @@ class AgentAPI:
             if name in fields and name in body:
                 kwargs[name] = body[name]
 
-        run, _ = self._start_run(route, kwargs,
-                                 tenant=request.headers.get("x-tenant-id"),
+        run, _ = self._start_run(route, kwargs, principal=principal,
                                  idempotency_key=request.headers.get(
                                      "idempotency-key"))
         model_name = body.get("model", "agentapi")
@@ -545,8 +631,17 @@ class AgentAPI:
 
     # -- endpoints -----------------------------------------------------------
     async def _get_run(self, request: Request) -> Response:
+        try:
+            principal = await self._principal(request)
+        except AuthError as exc:
+            return _auth_response(exc)
         run_id = request.path_params["run_id"]
         run = self.runs.get(run_id)
+        if run is not None:
+            try:
+                self._authorize_run(principal, run)
+            except AuthError as exc:
+                return _auth_response(exc)
         if run is None:
             if self.backend is not None:
                 row = self.backend.get_run(run_id)
@@ -557,7 +652,16 @@ class AgentAPI:
         return JSONResponse(run.describe())
 
     async def _get_events(self, request: Request) -> Response:
+        try:
+            principal = await self._principal(request)
+        except AuthError as exc:
+            return _auth_response(exc)
         run = self.runs.get(request.path_params["run_id"])
+        if run is not None:
+            try:
+                self._authorize_run(principal, run)
+            except AuthError as exc:
+                return _auth_response(exc)
         if run is None:
             if self.backend is not None:
                 stored = self.backend.events(request.path_params["run_id"])
@@ -579,7 +683,17 @@ class AgentAPI:
         return self._sse(run, from_seq=from_seq, on_disconnect=policy)
 
     async def _post_signal(self, request: Request) -> Response:
+        try:
+            principal = await self._principal(request)
+        except AuthError as exc:
+            return _auth_response(exc)
         run_id = request.path_params["run_id"]
+        run = self.runs.get(run_id)
+        if run is not None:
+            try:
+                self._authorize_run(principal, run)
+            except AuthError as exc:
+                return _auth_response(exc)
         signal = request.path_params["signal"]
         try:
             payload = await request.json() if await request.body() else None
@@ -590,6 +704,16 @@ class AgentAPI:
         return JSONResponse({"ok": True, "run_id": run_id, "signal": signal})
 
     async def _post_cancel(self, request: Request) -> Response:
+        try:
+            principal = await self._principal(request)
+        except AuthError as exc:
+            return _auth_response(exc)
+        run = self.runs.get(request.path_params["run_id"])
+        if run is not None:
+            try:
+                self._authorize_run(principal, run)
+            except AuthError as exc:
+                return _auth_response(exc)
         ok = self.runs.cancel(request.path_params["run_id"])
         if not ok:
             return JSONResponse({"error": "run not found or not cancellable"},
@@ -613,6 +737,10 @@ class AgentAPI:
 
     async def _post_mcp(self, request: Request) -> Response:
         try:
+            await self._principal(request)
+        except AuthError as exc:
+            return _auth_response(exc)
+        try:
             message = await request.json()
         except json.JSONDecodeError:
             return JSONResponse({"jsonrpc": "2.0", "id": None,
@@ -631,6 +759,12 @@ class AgentAPI:
     async def _get_skills(self, request: Request) -> Response:
         return JSONResponse({"skills": [s.describe()
                                         for s in self.skills.all()]})
+
+    async def _get_sessions(self, request: Request) -> Response:
+        if self.router is None:
+            return JSONResponse({"error": "session routing is not enabled"},
+                                status_code=404)
+        return JSONResponse(self.router.stats())
 
     async def _get_pools(self, request: Request) -> Response:
         return JSONResponse({"pools": [p.stats() for p in self.pools.values()]})
