@@ -55,6 +55,49 @@ curl -N localhost:8000/research -X POST \
 | Every project rewrites the model↔tools loop | `await app.agent(model=..., messages=...)` — Anthropic-format tool loop over your ops; tool calls/results land in the event log, budgets and deadlines apply per turn |
 | Process crash loses hours of agent work | `AgentAPI(durable="runs.db")` + `durability="durable"` routes: SQLite journal of events, steps and signals; `app.recover()` replays unfinished runs — completed steps don't re-execute, past signals re-deliver, history isn't duplicated |
 
+## Agent harness
+
+A sandboxed coding agent, wired to everything above:
+
+```python
+harness = attach_harness(
+    app, "/agent",
+    workspace="./work",
+    policy=Policy(default="ask").allow("read_file", "grep", "glob"),
+    skills_dir="./skills",
+)
+```
+
+That gives a durable run route with a real model-tools loop over a
+**sandboxed toolset** (`bash`, `read_file`, `write_file`, `edit_file`,
+`grep`, `glob`, `list_dir`), each registered as an op — so every tool is
+also an HTTP endpoint and an MCP tool.
+
+**Sandbox.** Every path resolves (symlinks included) inside the workspace
+or is refused; commands run under CPU/memory/process/file-size rlimits with
+a wall-clock timeout that kills the process *group*; the environment is
+scrubbed, so credentials in the server's environment are invisible to
+model-authored commands; output is capped so a runaway command cannot flood
+the context window. This narrows blast radius for a cooperative agent — for
+genuinely hostile code, still run the server in a container.
+
+**Policy with approval that survives a crash.** Rules are `allow` / `deny` /
+`ask`, matched on tool name and argument patterns, deny-first so a broad
+`allow("*")` cannot outrank a specific `deny`. An `ask` escalates through
+`ctx.pause()` — which means on a durable run **the process may exit while
+an approval is pending** and resume when the answer arrives. Approval
+prompts dying because a worker restarted is the usual reason teams abandon
+human-in-the-loop; here that failure mode does not exist.
+
+**Progressive disclosure for skills.** `Skill.discover(dir)` loads a tree of
+`SKILL.md` directories (the same convention Claude Code uses). The system
+prompt carries only names and descriptions; the agent calls `load_skill`
+for a body when a task needs it, so a dozen skills don't crowd out the
+conversation. Bundled files are readable via `read_skill_resource`, jailed
+to the skill's own directory.
+
+See [`examples/agent.py`](examples/agent.py) for a complete one.
+
 ## Authentication
 
 Without an authenticator the app is open — the same as FastAPI with no
@@ -171,7 +214,7 @@ Set the policy with `AgentAPI(determinism="raise" | "warn" | "off")`
 
 ## Status
 
-Working core with an 83-test suite: run lifecycle, resume-by-cursor,
+Working core with a 110-test suite: run lifecycle, resume-by-cursor,
 detach/cancel/drain policies, budgets, deadlines, pause/signal, steps, all
 three op surfaces, the agent loop, hooks, skills, fair-queueing pools, crash
 recovery (incl. crash-mid-stream with no duplicated events), determinism
@@ -179,7 +222,8 @@ checking, WebSocket and OpenAI-compatible transports, partial validation,
 the replay CLI, authentication and tenant isolation, a Postgres journal
 (exercised against a real server, including multi-worker claim), session
 affinity with prefix-cache routing, OpenTelemetry tracing, journal
-redaction, per-principal rate limiting, and cross-worker event fanout.
+redaction, per-principal rate limiting, cross-worker event fanout, and the
+sandboxed agent harness (containment, tool policy, approvals, skills).
 CI runs the suite on Python 3.11-3.13 against real Postgres and Redis
 services, plus ruff.
 

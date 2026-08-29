@@ -6,9 +6,20 @@ import os
 import httpx
 import pytest
 
-from agentapi import (AgentAPI, Done, MockLLM, Principal, RateLimit,
-                      RateLimited, Redactor, StateDelta, Token,
-                      bearer_tokens, ctx, step)
+from agentapi import (
+    AgentAPI,
+    Done,
+    MockLLM,
+    Principal,
+    RateLimit,
+    RateLimited,
+    Redactor,
+    StateDelta,
+    Token,
+    bearer_tokens,
+    ctx,
+    step,
+)
 
 pytestmark = pytest.mark.asyncio
 
