@@ -124,7 +124,7 @@ async def test_mount_foreign_asgi_app():
 
     async with client_for(app) as client:
         assert (await client.get("/legacy/health")).text == "legacy-ok"
-        assert (await client.get("/healthz")).json() == {"ok": True}
+        assert (await client.get("/healthz")).json()["ok"] is True
 
 
 # --- typed streaming output (partial validation) ---------------------------

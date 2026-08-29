@@ -135,6 +135,8 @@ class RunContext:
         self._step_journal: dict[str, Any] = {}
         self._step_commit = None      # durable backend hook, wired by the app
         self._det_seq = 0             # ordinal for journaled ctx.now/uuid/random
+        self._pending_writes: list = []   # queued from sync code, flushed on await
+        self._flush = None            # wired by the runtime
         self._llm_record = None       # backend hook: persist an LLM call
         self._llm_replay: list[Any] = []   # recorded calls to replay, in order
         self._llm_replay_cursor = 0
@@ -154,8 +156,15 @@ class RunContext:
             value = produce()
         self._step_journal[key] = value
         if self._step_commit is not None:
+            # Called from sync code (ctx.now() cannot await), so queue it;
+            # the next emit, pause or terminal event flushes the queue.
             self._step_commit(key, value)
         return value
+
+    async def flush_writes(self) -> None:
+        """Persist anything queued by synchronous journaled accessors."""
+        if self._flush is not None:
+            await self._flush()
 
     def now(self) -> float:
         """Wall clock, journaled: replays return the original timestamp."""
@@ -265,6 +274,9 @@ class RunContext:
             schema_dict = (schema.model_json_schema()
                            if hasattr(schema, "model_json_schema") else schema)
         queue = self._signals.setdefault(signal, asyncio.Queue())
+        # A pause can last hours; make sure everything so far is durable
+        # before the process has the chance to exit.
+        await self.flush_writes()
         await self.emit(Paused(signal=signal, schema=schema_dict))
         timeout_s = None if timeout is None else parse_duration(timeout)
         timeout_s = min(

@@ -1,0 +1,45 @@
+services:
+  agentapi:
+    build: .
+    ports: ["8000:8000"]
+    environment:
+      AGENTAPI_DURABLE: postgresql://agentapi:agentapi@postgres:5432/agentapi
+      AGENTAPI_FANOUT: redis://redis:6379/0
+      AGENTAPI_REQUIRE_AUTH: "true"
+      AGENTAPI_REDACT: "true"
+      AGENTAPI_RATE_LIMIT_PER_MINUTE: "120"
+      AGENTAPI_SHUTDOWN_GRACE_S: "30"
+      AGENTAPI_LOG_LEVEL: INFO
+      ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY:?set ANTHROPIC_API_KEY}
+    depends_on:
+      postgres: {condition: service_healthy}
+      redis: {condition: service_healthy}
+    # Give the app time to drain in-flight runs before SIGKILL.
+    stop_grace_period: 45s
+    deploy:
+      resources:
+        limits: {memory: 1G}
+
+  postgres:
+    image: postgres:16
+    environment:
+      POSTGRES_USER: agentapi
+      POSTGRES_PASSWORD: agentapi
+      POSTGRES_DB: agentapi
+    volumes: ["pgdata:/var/lib/postgresql/data"]
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U agentapi"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  redis:
+    image: redis:7
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+volumes:
+  pgdata:
