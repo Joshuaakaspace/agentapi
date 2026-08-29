@@ -71,6 +71,9 @@ def step(fn: F | None = None, *, retries: int = 0,
                     journal[key] = result
                     if context._step_commit is not None:
                         context._step_commit(key, result)
+                        # Step results gate side effects on replay, so they
+                        # must land before the step is considered done.
+                        await context.flush_writes()
                     return result
                 except (asyncio.CancelledError, KeyboardInterrupt):
                     raise

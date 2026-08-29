@@ -40,6 +40,7 @@ from starlette.routing import Mount, Route, WebSocketRoute
 from starlette.websockets import WebSocket, WebSocketDisconnect
 
 from .auth import ANONYMOUS, Authenticator, AuthError, Principal, owns
+from .config import Config
 from .context import RunContext, parse_duration
 from .determinism import MODES as DETERMINISM_MODES
 from .events import parse_event
@@ -47,11 +48,12 @@ from .hooks import Hooks
 from .journal import SQLiteBackend
 from .llm import BaseLLM
 from .mcp import MCPServer
+from .observability import Metrics, setup_logging
 from .ops import OpRegistry, _schema_from_signature
 from .pools import Pool
 from .ratelimit import RateLimit, RateLimited
 from .redaction import NullRedactor
-from .run import RunManager
+from .run import RunManager, RunStatus
 from .sessions import SessionRouter
 from .skills import Skill, SkillSet
 
@@ -77,6 +79,10 @@ def _make_backend(durable: str | Any | None):
         from .postgres import PostgresBackend
         return PostgresBackend(durable)
     return SQLiteBackend(durable)
+
+
+class _BodyTooLarge(Exception):
+    """Request body exceeded the configured cap."""
 
 
 def _auth_response(exc: AuthError) -> JSONResponse:
@@ -113,7 +119,11 @@ class AgentAPI:
                  require_auth: bool = False,
                  redactor: Any = None,
                  rate_limit: RateLimit | None = None,
-                 fanout: Any = None) -> None:
+                 fanout: Any = None,
+                 config: Config | None = None,
+                 metrics: bool = True,
+                 shutdown_grace_s: float = 30.0,
+                 max_body_bytes: int = 4 << 20) -> None:
         if determinism not in DETERMINISM_MODES:
             raise ValueError(
                 f"determinism must be one of {DETERMINISM_MODES}")
@@ -126,6 +136,11 @@ class AgentAPI:
         self.backend = _make_backend(durable)
         self.redactor = redactor or NullRedactor()
         self.rate_limit = rate_limit
+        self.config = config or Config()
+        self.shutdown_grace_s = shutdown_grace_s
+        self.max_body_bytes = max_body_bytes
+        self._draining = False
+        self.metrics = Metrics() if metrics else None
         self.fanout = _make_fanout(fanout)
         self.runs = RunManager(retention_s=retention_s, backend=self.backend,
                                redactor=self.redactor, fanout=self.fanout)
@@ -139,8 +154,43 @@ class AgentAPI:
         self._openai_route: str | None = None
         self._asgi: Starlette | None = None
         self.mcp = MCPServer(title, self._McpOps(self), version)
+        if self.metrics is not None:
+            self.metrics.install(self)
         if llm is not None:
             llm.hooks = self.hooks
+
+    @classmethod
+    def from_env(cls, prefix: str = "AGENTAPI_", **overrides: Any) -> AgentAPI:
+        """Build from environment variables; explicit kwargs win.
+
+        Promotes the same image between environments without a rebuild.
+        """
+        config = Config.from_env(prefix)
+        setup_logging(config.log_level, json_output=config.log_json)
+        rate_limit = overrides.pop("rate_limit", None)
+        if rate_limit is None and config.rate_limit_per_minute:
+            rate_limit = RateLimit(per_minute=config.rate_limit_per_minute,
+                                   burst=config.rate_limit_burst)
+        redactor = overrides.pop("redactor", None)
+        if redactor is None and config.redact:
+            from .redaction import Redactor
+            redactor = Redactor()
+        settings: dict[str, Any] = {
+            "durable": config.durable, "fanout": config.fanout,
+            "determinism": config.determinism,
+            "require_auth": config.require_auth,
+            "retention_s": config.retention_s,
+            "metrics": config.metrics,
+            "shutdown_grace_s": config.shutdown_grace_s,
+            "max_body_bytes": config.max_body_bytes,
+            "rate_limit": rate_limit, "redactor": redactor,
+            "config": config,
+        }
+        settings.update(overrides)
+        instance = cls(**settings)
+        logging.getLogger("agentapi").info(
+            "configured", extra={"extra": config.describe()})
+        return instance
 
     class _McpOps:
         """Ops view for MCP that includes skill ops."""
@@ -342,8 +392,55 @@ class AgentAPI:
             yield
         finally:
             gc_task.cancel()
-            if self.backend is not None:
+            await self.shutdown()
+
+    async def shutdown(self) -> None:
+        """Drain in-flight runs before the process exits.
+
+        A rolling deploy sends SIGTERM and then waits. Without this the
+        server dies mid-run: durable runs would recover on the next worker,
+        but resumable ones are simply lost, and the client sees a truncated
+        stream either way. So: stop accepting work (readiness flips first,
+        which pulls this pod out of the load balancer), let running work
+        finish inside the grace period, and only then persist and close.
+        """
+        self._draining = True
+        deadline = asyncio.get_running_loop().time() + self.shutdown_grace_s
+        log = logging.getLogger("agentapi")
+
+        while True:
+            # A paused run is parked on a human, not doing work — it may sit
+            # there for hours. Waiting for it would block every deploy, and
+            # a durable one resumes on another worker anyway.
+            pending = [r for r in self.runs.runs.values()
+                       if r.task is not None and not r.task.done()
+                       and r.status is not RunStatus.PAUSED]
+            if not pending:
+                break
+            remaining = deadline - asyncio.get_running_loop().time()
+            if remaining <= 0:
+                log.warning("shutdown grace expired with %d run(s) in flight; "
+                            "durable runs will resume on another worker",
+                            len(pending))
+                for run in pending:
+                    self.runs.drain(run.id)     # ask them to stop cleanly
+                await asyncio.wait([r.task for r in pending], timeout=2)
+                break
+            await asyncio.wait([r.task for r in pending],
+                               timeout=min(remaining, 1.0))
+
+        if self.backend is not None:
+            try:
                 self.backend.flush()
+            except Exception:  # noqa: BLE001 - shutdown must not raise
+                log.exception("failed to flush the journal on shutdown")
+        if self.fanout is not None:
+            close = getattr(self.fanout, "close", None)
+            if close is not None:
+                try:
+                    await close()
+                except Exception:  # noqa: BLE001
+                    log.warning("fanout close failed", exc_info=True)
 
     # -- recovery (tier-2 durability) ---------------------------------------
     def recover(self) -> list[str]:
@@ -420,20 +517,31 @@ class AgentAPI:
             Route("/skills", self._get_skills, methods=["GET"]),
             Route("/pools", self._get_pools, methods=["GET"]),
             Route("/sessions", self._get_sessions, methods=["GET"]),
-            Route("/healthz", lambda r: JSONResponse({"ok": True}),
-                  methods=["GET"]),
+            Route("/healthz", self._get_healthz, methods=["GET"]),
+            Route("/readyz", self._get_readyz, methods=["GET"]),
+            Route("/metrics", self._get_metrics, methods=["GET"]),
         ]
         routes += [Mount(path, app=app) for path, app in self._mounts]
         return Starlette(routes=routes, lifespan=self._lifespan)
 
     def _make_run_endpoint(self, route: _RunRoute) -> Callable[..., Any]:
         async def endpoint(request: Request) -> Response:
+            if self._draining:
+                # Shedding here rather than accepting work this process will
+                # not live long enough to finish.
+                return JSONResponse(
+                    {"error": "server is shutting down"}, status_code=503,
+                    headers={"Retry-After": "5", "Connection": "close"})
             try:
                 principal = await self._principal(request)
             except AuthError as exc:
                 return _auth_response(exc)
             try:
-                body = await request.json() if await request.body() else {}
+                raw = await self._read_body(request)
+            except _BodyTooLarge as exc:
+                return JSONResponse({"error": str(exc)}, status_code=413)
+            try:
+                body = json.loads(raw) if raw else {}
             except json.JSONDecodeError:
                 return JSONResponse({"error": "invalid JSON body"}, status_code=400)
             try:
@@ -474,6 +582,27 @@ class AgentAPI:
                              on_disconnect=route.on_disconnect,
                              status_code=201 if created else 200)
         return endpoint
+
+    async def _read_body(self, request: Request) -> bytes:
+        """Read a request body under a size cap.
+
+        Streams and stops early: an unbounded read is a trivial way to make
+        the server allocate until it dies.
+        """
+        declared = request.headers.get("content-length")
+        if (declared is not None and declared.isdigit()
+                and int(declared) > self.max_body_bytes):
+            raise _BodyTooLarge(
+                f"request body exceeds {self.max_body_bytes} bytes")
+        chunks: list[bytes] = []
+        size = 0
+        async for chunk in request.stream():
+            size += len(chunk)
+            if size > self.max_body_bytes:
+                raise _BodyTooLarge(
+                    f"request body exceeds {self.max_body_bytes} bytes")
+            chunks.append(chunk)
+        return b"".join(chunks)
 
     def _make_op_endpoint(self, op: Any) -> Callable[..., Any]:
         async def endpoint(request: Request) -> Response:
@@ -821,6 +950,52 @@ class AgentAPI:
             return JSONResponse({"error": "session routing is not enabled"},
                                 status_code=404)
         return JSONResponse(self.router.stats())
+
+    async def _get_healthz(self, request: Request) -> Response:
+        """Liveness: is the process itself functioning?
+
+        Deliberately does not check dependencies — a database blip should
+        not cause the orchestrator to kill and restart an otherwise healthy
+        process, which is how a brief outage becomes a crash loop.
+        """
+        return JSONResponse({"ok": True, "version": self.version})
+
+    async def _get_readyz(self, request: Request) -> Response:
+        """Readiness: should this instance receive traffic right now?
+
+        Checks dependencies and reports draining, so a shutting-down pod
+        leaves the load balancer before it stops answering.
+        """
+        checks: dict[str, Any] = {"draining": self._draining}
+        healthy = not self._draining
+
+        if self.backend is not None:
+            try:
+                await asyncio.wait_for(
+                    asyncio.to_thread(self.backend.get_run, "__readiness__"),
+                    timeout=2.0)
+                checks["journal"] = "ok"
+            except Exception as exc:  # noqa: BLE001
+                checks["journal"] = f"error: {type(exc).__name__}"
+                healthy = False
+        if self.llm is None:
+            checks["llm"] = "unconfigured"
+
+        checks["runs_in_flight"] = sum(
+            1 for r in self.runs.runs.values()
+            if r.task is not None and not r.task.done()
+            and r.status is not RunStatus.PAUSED)
+        checks["runs_paused"] = sum(1 for r in self.runs.runs.values()
+                                    if r.status is RunStatus.PAUSED)
+        return JSONResponse({"ready": healthy, **checks},
+                            status_code=200 if healthy else 503)
+
+    async def _get_metrics(self, request: Request) -> Response:
+        if self.metrics is None:
+            return JSONResponse({"error": "metrics are disabled"},
+                                status_code=404)
+        return Response(self.metrics.render(self),
+                        media_type="text/plain; version=0.0.4")
 
     async def _get_pools(self, request: Request) -> Response:
         return JSONResponse({"pools": [p.stats() for p in self.pools.values()]})

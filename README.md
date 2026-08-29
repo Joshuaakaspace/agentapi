@@ -133,6 +133,26 @@ each event costs ~0.3 ms per event. That is the price of resumability, and
 it is 0.1%–0.01% of a real LLM turn. Routes that need none of it can opt out
 with `durability="ephemeral"`.
 
+## Production
+
+See **[PRODUCTION.md](PRODUCTION.md)** for the deployment guide, the
+configuration you should set, and an explicit list of what is *not* yet
+verified.
+
+```bash
+docker compose up          # app + postgres + redis
+```
+
+```python
+app = AgentAPI.from_env(llm=AnthropicLLM())   # 12-factor config
+```
+
+Operational surface: `/healthz` (liveness, ignores dependencies so a
+database blip is not a crash loop), `/readyz` (readiness — checks the
+journal, reports `draining`), `/metrics` (Prometheus), JSON logs keyed by
+run id, and graceful shutdown that drains in-flight runs on SIGTERM while
+*not* waiting on runs parked for human approval.
+
 ## Surfaces
 
 ```
@@ -146,7 +166,8 @@ POST /v1/chat/completions      OpenAI-compatible (app.openai_compat("/chat"))
 GET  /ops                      op catalog          GET /llm/tools   tool defs
 POST /mcp                      MCP server          GET /skills      skills
 GET  /pools                    admission stats     GET /sessions    routing
-GET  /healthz
+GET  /healthz                  liveness            GET /readyz      readiness
+GET  /metrics                  Prometheus
 ```
 
 Already have a FastAPI service? Adopt per route instead of rewriting:
@@ -214,7 +235,7 @@ Set the policy with `AgentAPI(determinism="raise" | "warn" | "off")`
 
 ## Status
 
-Working core with a 110-test suite: run lifecycle, resume-by-cursor,
+Working core with a 126-test suite: run lifecycle, resume-by-cursor,
 detach/cancel/drain policies, budgets, deadlines, pause/signal, steps, all
 three op surfaces, the agent loop, hooks, skills, fair-queueing pools, crash
 recovery (incl. crash-mid-stream with no duplicated events), determinism
@@ -223,7 +244,9 @@ the replay CLI, authentication and tenant isolation, a Postgres journal
 (exercised against a real server, including multi-worker claim), session
 affinity with prefix-cache routing, OpenTelemetry tracing, journal
 redaction, per-principal rate limiting, cross-worker event fanout, and the
-sandboxed agent harness (containment, tool policy, approvals, skills).
+sandboxed agent harness (containment, tool policy, approvals, skills), and
+the operational surface (probes, metrics, graceful shutdown, 12-factor
+config).
 CI runs the suite on Python 3.11-3.13 against real Postgres and Redis
 services, plus ruff.
 
