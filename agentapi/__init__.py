@@ -30,6 +30,7 @@ from .events import (
 from .harness import Harness, attach_harness
 from .hooks import Hooks
 from .llm import AnthropicLLM, BaseLLM, MockLLM
+from .mcp_client import MCPConnection, MCPError
 from .partial import PartialModel, complete_json
 from .permissions import DEFAULT_SAFE_POLICY, Decision, PermissionDenied, Policy
 from .pools import Pool, PoolSaturated
@@ -48,7 +49,7 @@ __version__ = "0.1.0"
 __all__ = [
     "ANONYMOUS", "AgentAPI", "AnthropicLLM", "AuthError", "Backend",
     "BaseLLM", "BudgetExceeded",
-    "DeadlineExceeded", "Done", "Event", "Hooks", "Message", "MockLLM",
+    "DeadlineExceeded", "Done", "Event", "Hooks", "MCPConnection", "MCPError", "Message", "MockLLM",
     "NondeterminismError", "PartialModel", "Paused", "Pool", "PoolSaturated",
     "DEFAULT_SAFE_POLICY", "Decision", "Harness", "Limits", "NullRedactor",
     "PathEscape", "PermissionDenied", "Policy", "Principal", "RateLimit",

@@ -22,6 +22,17 @@ from .sandbox import Limits, Sandbox
 from .skills import Skill
 from .tools import register_tools
 
+# Scripts run through an explicit interpreter rather than relying on the
+# executable bit: a skill copied out of a zip or a git checkout on Windows
+# routinely arrives without it, and a confusing "permission denied" is a
+# worse outcome than choosing the interpreter from the extension.
+_INTERPRETERS = {".py": ["python3"], ".sh": ["bash"], ".js": ["node"],
+                 ".rb": ["ruby"]}
+
+
+def _interpreter_for(path: Path) -> list[str]:
+    return _INTERPRETERS.get(path.suffix, ["bash"])
+
 SYSTEM_PROMPT = """You are an agent working inside a sandboxed workspace.
 
 Rules that matter:
@@ -50,6 +61,7 @@ class Harness:
         self.sandbox = Sandbox(workspace, limits=limits, network=network)
         self.policy = policy or DEFAULT_SAFE_POLICY
         self.system = system or SYSTEM_PROMPT
+        self.approval_timeout = approval_timeout
         self.tool_names = register_tools(
             app, self.sandbox, self.policy, include=tools,
             approval_timeout=approval_timeout)
@@ -58,6 +70,11 @@ class Harness:
             for skill in Skill.discover(skills_dir):
                 app.include_skill(skill)
             self._register_skill_loader()
+
+    async def _gate(self, tool: str, arguments: dict) -> None:
+        from .permissions import enforce
+        await enforce(self.policy, tool, arguments,
+                      timeout=self.approval_timeout)
 
     def _register_skill_loader(self) -> None:
         """Expose skills through a tool rather than the system prompt.
@@ -87,7 +104,42 @@ class Harness:
             return {"skill": skill, "path": path,
                     "content": found.resource(path)}
 
-        self.tool_names += ["load_skill", "read_skill_resource"]
+        harness = self
+
+        @app.op(name="run_skill_script")
+        async def run_skill_script(skill: str, script: str,
+                                   args: list[str] | None = None) -> dict:
+            """Run an executable script bundled with a skill, sandboxed.
+
+            Skills often ship a helper — a linter, a formatter, a converter —
+            that is far better executed than reimplemented by the model each
+            time. The script runs under the same containment as every other
+            command: resource limits, a scrubbed environment and the
+            workspace as its working directory.
+            """
+            await harness._gate("run_skill_script",
+                                {"skill": skill, "script": script})
+            found = app.skills.get(skill)
+            if found is None:
+                raise ValueError(f"unknown skill {skill!r}")
+            # resource() refuses paths outside the skill directory.
+            found.resource(script)
+            source = (found.path / script).resolve()
+            interpreter = _interpreter_for(source)
+            result = await harness.sandbox.run(
+                [*interpreter, str(source), *(args or [])])
+            return {"skill": skill, "script": script, **result.as_dict()}
+
+        self.tool_names += ["load_skill", "read_skill_resource",
+                            "run_skill_script"]
+
+    async def connect_mcp(self, name: str, **kwargs: Any) -> Any:
+        """Attach an MCP server's tools to this harness, policy-gated."""
+        connection = await self.app.connect_mcp(name, policy=self.policy,
+                                                **kwargs)
+        self.tool_names += [f"{name}__{t['name']}" for t in connection.tools
+                            if t.get("name")]
+        return connection
 
     def system_prompt(self) -> str:
         catalog = self.app.skills.catalog()
