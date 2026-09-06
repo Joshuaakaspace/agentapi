@@ -1,0 +1,27 @@
+name: Live model report
+description: You ran agentapi against a real LLM API — tell us what happened, good or bad
+labels: ["live-run", "help wanted"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        This is the most valuable report we can get right now. `AnthropicLLM` has
+        far less real-world mileage than the rest of the runtime. Working runs are
+        as useful to hear about as broken ones.
+  - type: input
+    id: model
+    attributes:
+      label: Model id
+    validations: {required: true}
+  - type: dropdown
+    id: outcome
+    attributes:
+      label: Outcome
+      options: ["Worked as documented", "Worked with caveats", "Broke"]
+    validations: {required: true}
+  - type: textarea
+    id: details
+    attributes:
+      label: Details
+      description: Streaming? Tool use? Usage numbers matched the provider's? Anything surprising.
+    validations: {required: true}

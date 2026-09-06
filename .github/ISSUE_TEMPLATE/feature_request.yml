@@ -1,0 +1,21 @@
+name: Feature request
+description: Something the runtime should do
+labels: ["enhancement"]
+body:
+  - type: textarea
+    id: problem
+    attributes:
+      label: The problem this solves
+      description: What are you doing today that this would make easier or possible?
+    validations: {required: true}
+  - type: textarea
+    id: proposal
+    attributes:
+      label: Proposed shape
+      description: API sketch, config knob, whatever fits. Doesn't need to be right.
+  - type: checkboxes
+    id: fit
+    attributes:
+      label: Fit
+      options:
+        - label: I've checked DESIGN.md and this doesn't conflict with "the run is the unit of work"

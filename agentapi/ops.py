@@ -55,7 +55,10 @@ class Op:
         """Validated invocation used by every surface. Emits ToolCall /
         ToolResult events when running inside a run context."""
         parsed = self.args_model.model_validate(arguments or {})
-        kwargs = {k: getattr(parsed, k) for k in type(parsed).model_fields}
+        # model_dump() covers pydantic models and the pass-through validator
+        # used for remote MCP tools, whose schema lives on the server.
+        kwargs = (parsed.model_dump() if hasattr(parsed, "model_dump")
+                  else {k: getattr(parsed, k) for k in type(parsed).model_fields})
         context = _current.get()
         if context is not None:
             await context.emit(ToolCall(name=self.name, arguments=arguments or {},
