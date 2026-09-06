@@ -72,6 +72,20 @@ hold prompts.
 **Postgres connection pool.** `PostgresBackend` opens up to 8 connections
 per worker. Multiply by worker count and compare against `max_connections`.
 
+## Third-party MCP servers
+
+Tools adopted from an external MCP server run with the same policy gate as
+local ones, and stdio servers get a scrubbed environment and resource
+limits. That still leaves the server itself trusted with whatever you pass
+it and whatever it can reach on the network:
+
+- Grant credentials explicitly with `env=`, scoped to what that server needs.
+- A stdio server runs as a subprocess of your worker; it shares the host's
+  network unless you isolate the container.
+- Tool *descriptions* come from the server and are read by the model. Treat
+  a server you do not control as able to influence the agent's behaviour,
+  and gate its tools with `ask` rather than `allow`.
+
 ## Sandbox: what it does and does not promise
 
 It reduces blast radius for a **cooperative** agent — one that may be

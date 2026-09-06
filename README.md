@@ -89,6 +89,30 @@ an approval is pending** and resume when the answer arrives. Approval
 prompts dying because a worker restarted is the usual reason teams abandon
 human-in-the-loop; here that failure mode does not exist.
 
+**MCP in both directions.** agentapi already *serves* MCP; it is now also a
+*client*, so an agent can borrow tools from other servers:
+
+```python
+await harness.connect_mcp("github", command=["npx", "-y",
+                                             "@modelcontextprotocol/server-github"])
+await harness.connect_mcp("internal", url="https://tools.internal/mcp")
+```
+
+Discovered tools become ops named `server__tool` and inherit **everything**
+a local tool gets: permission policy (including human approval that
+survives a restart), event-log entries, usage accounting, budgets and
+deadlines. A third-party tool is not more trusted than a local one —
+arguably less. stdio servers launch as subprocesses under resource limits
+with a **scrubbed environment**, so an MCP server never inherits the API
+keys in the host's environment; pass what it needs explicitly with `env=`.
+A server that dies, hangs or returns garbage degrades to a tool error the
+model can read, never an exception that kills the run.
+
+**Skill scripts run sandboxed.** Skills often ship a helper — a linter, a
+converter — better executed than reimplemented by the model each turn.
+`run_skill_script` runs it under the same containment as every other
+command, jailed to the skill's own directory.
+
 **Progressive disclosure for skills.** `Skill.discover(dir)` loads a tree of
 `SKILL.md` directories (the same convention Claude Code uses). The system
 prompt carries only names and descriptions; the agent calls `load_skill`
@@ -167,7 +191,7 @@ GET  /ops                      op catalog          GET /llm/tools   tool defs
 POST /mcp                      MCP server          GET /skills      skills
 GET  /pools                    admission stats     GET /sessions    routing
 GET  /healthz                  liveness            GET /readyz      readiness
-GET  /metrics                  Prometheus
+GET  /metrics                  Prometheus          GET /mcp/servers connected
 ```
 
 Already have a FastAPI service? Adopt per route instead of rewriting:
@@ -235,7 +259,7 @@ Set the policy with `AgentAPI(determinism="raise" | "warn" | "off")`
 
 ## Status
 
-Working core with a 126-test suite: run lifecycle, resume-by-cursor,
+Working core with a 144-test suite: run lifecycle, resume-by-cursor,
 detach/cancel/drain policies, budgets, deadlines, pause/signal, steps, all
 three op surfaces, the agent loop, hooks, skills, fair-queueing pools, crash
 recovery (incl. crash-mid-stream with no duplicated events), determinism
@@ -246,7 +270,7 @@ affinity with prefix-cache routing, OpenTelemetry tracing, journal
 redaction, per-principal rate limiting, cross-worker event fanout, and the
 sandboxed agent harness (containment, tool policy, approvals, skills), and
 the operational surface (probes, metrics, graceful shutdown, 12-factor
-config).
+config), and MCP client support with sandboxed skill scripts.
 CI runs the suite on Python 3.11-3.13 against real Postgres and Redis
 services, plus ruff.
 

@@ -48,6 +48,7 @@ from .hooks import Hooks
 from .journal import SQLiteBackend
 from .llm import BaseLLM
 from .mcp import MCPServer
+from .mcp_client import HTTPTransport, MCPConnection, MCPError, StdioTransport
 from .observability import Metrics, setup_logging
 from .ops import OpRegistry, _schema_from_signature
 from .pools import Pool
@@ -79,6 +80,52 @@ def _make_backend(durable: str | Any | None):
         from .postgres import PostgresBackend
         return PostgresBackend(durable)
     return SQLiteBackend(durable)
+
+
+def _passthrough_model(name: str, schema: dict[str, Any]) -> Any:
+    """A validator that accepts whatever the remote schema declares.
+
+    Building a pydantic model from arbitrary JSON Schema is a rabbit hole;
+    the remote server validates its own arguments, so we check the required
+    keys are present and otherwise pass the payload through untouched.
+    """
+    required = list(schema.get("required") or [])
+    known = set(schema.get("properties") or {})
+
+    class _Passthrough:
+        model_fields: dict[str, Any] = {}
+
+        def __init__(self, data: dict[str, Any]) -> None:
+            self._data = data
+
+        @classmethod
+        def model_validate(cls, data: Any) -> _Passthrough:
+            payload = dict(data or {})
+            missing = [key for key in required if key not in payload]
+            if missing:
+                raise ValueError(
+                    f"{name} is missing required argument(s): "
+                    f"{', '.join(missing)}")
+            unknown = set(payload) - known if known else set()
+            if unknown and schema.get("additionalProperties") is False:
+                raise ValueError(
+                    f"{name} got unexpected argument(s): "
+                    f"{', '.join(sorted(unknown))}")
+            return cls(payload)
+
+        def model_dump(self) -> dict[str, Any]:
+            return dict(self._data)
+
+        def __iter__(self):
+            return iter(self._data)
+
+        def __getattr__(self, item: str) -> Any:
+            try:
+                return self._data[item]
+            except KeyError:
+                raise AttributeError(item) from None
+
+    return _Passthrough
 
 
 class _BodyTooLarge(Exception):
@@ -149,6 +196,7 @@ class AgentAPI:
         self.skills = SkillSet()
         self.pools: dict[str, Pool] = {}
         self.router: SessionRouter | None = None
+        self.mcp_servers: dict[str, MCPConnection] = {}
         self._run_routes: dict[str, _RunRoute] = {}
         self._mounts: list[tuple[str, Any]] = []
         self._openai_route: str | None = None
@@ -311,6 +359,85 @@ class AgentAPI:
         self._openai_route = route
         self._asgi = None
 
+    async def connect_mcp(self, name: str, *,
+                          command: list[str] | None = None,
+                          url: str | None = None,
+                          env: dict[str, str] | None = None,
+                          headers: dict[str, str] | None = None,
+                          cwd: str | None = None,
+                          policy: Any = None,
+                          timeout: float = 30.0,
+                          prefix: str | None = None) -> MCPConnection:
+        """Connect to an external MCP server and adopt its tools.
+
+        Each discovered tool becomes an op named ``<server>__<tool>``, so it
+        inherits the permission policy, the event log, usage accounting and
+        budgets — a third-party tool is not more trusted than a local one.
+
+        Pass ``command`` for a stdio server (launched as a subprocess with a
+        scrubbed environment and resource limits) or ``url`` for HTTP.
+        """
+        if (command is None) == (url is None):
+            raise ValueError("pass exactly one of command= or url=")
+        if name in self.mcp_servers:
+            raise ValueError(f"MCP server {name!r} is already connected")
+
+        transport = (StdioTransport(command, env=env, cwd=cwd)
+                     if command is not None
+                     else HTTPTransport(url, headers=headers))
+        connection = await MCPConnection(name, transport,
+                                         timeout=timeout).connect()
+        self.mcp_servers[name] = connection
+        self._register_mcp_tools(connection, policy, prefix or f"{name}__")
+        self._asgi = None
+        logging.getLogger("agentapi").info(
+            "connected MCP server", extra={"extra": {
+                "server": name, "tools": len(connection.tools)}})
+        return connection
+
+    def _register_mcp_tools(self, connection: MCPConnection, policy: Any,
+                            prefix: str) -> None:
+        for tool in connection.tools:
+            remote_name = tool.get("name")
+            if not remote_name:
+                continue
+            op_name = f"{prefix}{remote_name}"
+            if self.ops.get(op_name) is not None:
+                continue
+            self._register_remote_op(connection, remote_name, op_name,
+                                     tool, policy)
+
+    def _register_remote_op(self, connection: MCPConnection, remote_name: str,
+                            op_name: str, tool: dict[str, Any],
+                            policy: Any) -> None:
+        """Register one remote tool, preserving the server's own schema."""
+        description = (tool.get("description")
+                       or f"{remote_name} (via MCP server {connection.name})")
+        schema = tool.get("inputSchema") or {"type": "object", "properties": {}}
+
+        async def invoke(**arguments: Any) -> Any:
+            if policy is not None:
+                from .permissions import enforce
+                await enforce(policy, op_name, arguments)
+            try:
+                return await connection.call(remote_name, arguments)
+            except MCPError as exc:
+                # A failing third-party server becomes a tool error the model
+                # can read and route around, never an exception that ends
+                # the run.
+                raise RuntimeError(f"MCP {connection.name}: {exc}") from exc
+
+        op = self.ops.register(invoke, name=op_name, description=description)
+        # The server's schema is authoritative: it knows its own arguments
+        # better than anything we could infer from **kwargs.
+        op.args_schema = schema
+        op.args_model = _passthrough_model(op_name, schema)
+
+    async def disconnect_mcp(self, name: str) -> None:
+        connection = self.mcp_servers.pop(name, None)
+        if connection is not None:
+            await connection.close()
+
     def sessions(self, backends: list, **kwargs: Any) -> SessionRouter:
         """Enable sticky, prefix-cache-aware routing across ``backends``."""
         self.router = SessionRouter(backends, **kwargs)
@@ -434,6 +561,12 @@ class AgentAPI:
                 self.backend.flush()
             except Exception:  # noqa: BLE001 - shutdown must not raise
                 log.exception("failed to flush the journal on shutdown")
+        for name, connection in list(self.mcp_servers.items()):
+            try:
+                await connection.close()
+            except Exception:  # noqa: BLE001 - shutdown must not raise
+                log.warning("failed to close MCP server %s", name,
+                            exc_info=True)
         if self.fanout is not None:
             close = getattr(self.fanout, "close", None)
             if close is not None:
@@ -517,6 +650,7 @@ class AgentAPI:
             Route("/skills", self._get_skills, methods=["GET"]),
             Route("/pools", self._get_pools, methods=["GET"]),
             Route("/sessions", self._get_sessions, methods=["GET"]),
+            Route("/mcp/servers", self._get_mcp_servers, methods=["GET"]),
             Route("/healthz", self._get_healthz, methods=["GET"]),
             Route("/readyz", self._get_readyz, methods=["GET"]),
             Route("/metrics", self._get_metrics, methods=["GET"]),
@@ -944,6 +1078,10 @@ class AgentAPI:
     async def _get_skills(self, request: Request) -> Response:
         return JSONResponse({"skills": [s.describe()
                                         for s in self.skills.all()]})
+
+    async def _get_mcp_servers(self, request: Request) -> Response:
+        return JSONResponse({"servers": [c.describe()
+                                         for c in self.mcp_servers.values()]})
 
     async def _get_sessions(self, request: Request) -> Response:
         if self.router is None:
