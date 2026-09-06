@@ -1,20 +1,38 @@
+<div align="center">
+
 # agentapi
 
-**A server runtime where the Run — not the Request — is the unit of work.**
+**A server runtime where the Run — not the Request — is the unit of work.**<br>
+FastAPI-shaped ergonomics for LLM, agent and orchestration workloads.
 
-FastAPI is superb at requests: short, stateless, owned by a TCP connection,
-cheap to retry. LLM and agent workloads are none of those things. A run is
-long, stateful, multi-step, expensive to retry, must survive the connection
-that started it, and is metered in dollars rather than requests. `agentapi`
-keeps FastAPI-shaped ergonomics but makes the run first-class; HTTP, SSE and
-MCP are just ways to *attach* to one.
+[![CI](https://github.com/Joshuaakaspace/agentapi/actions/workflows/ci.yml/badge.svg)](https://github.com/Joshuaakaspace/agentapi/actions/workflows/ci.yml)
+[![Python 3.11+](https://img.shields.io/badge/python-3.11%2B-blue.svg)](pyproject.toml)
+[![License: MIT](https://img.shields.io/badge/license-MIT-green.svg)](LICENSE)
+[![Tests](https://img.shields.io/badge/tests-144%20passing-brightgreen.svg)](tests/)
+[![Ruff](https://img.shields.io/endpoint?url=https://raw.githubusercontent.com/astral-sh/ruff/main/assets/badge/v2.json)](https://github.com/astral-sh/ruff)
+[![PRs welcome](https://img.shields.io/badge/PRs-welcome-8A2BE2.svg)](CONTRIBUTING.md)
+[![GitHub stars](https://img.shields.io/github/stars/Joshuaakaspace/agentapi?style=social)](https://github.com/Joshuaakaspace/agentapi/stargazers)
 
-See [DESIGN.md](DESIGN.md) for the full rationale.
+<img src="docs/assets/disconnect-survival.gif" alt="A client disconnects mid-stream; the run finishes anyway and every event is still replayable" width="860">
+
+*The client hangs up mid-generation. The run finishes anyway. Every token you paid for is still there.*
+
+</div>
+
+---
+
+## Why this exists
+
+FastAPI is superb at **requests**: short, stateless, owned by a TCP connection, cheap to retry.
+
+LLM and agent workloads are none of those things. A **run** is long, stateful, multi-step, expensive to retry, must survive the connection that started it, and is metered in dollars rather than requests. Nearly every practical complaint about FastAPI-for-agents — disconnects killing generations you already paid for, streams that can't resume, no durable execution, no admission control, no budget model — is a symptom of that one mismatch.
+
+`agentapi` keeps FastAPI's ergonomics and makes the run first-class. HTTP, SSE, WebSocket and MCP are just ways to *attach* to one.
 
 ```python
 from agentapi import AgentAPI, AnthropicLLM, Done, Token, ctx
 
-app = AgentAPI(llm=AnthropicLLM())
+app = AgentAPI(llm=AnthropicLLM(), durable="postgresql://...")
 
 @app.run("/chat", on_disconnect="detach", deadline="120s", budget_usd=0.50)
 async def chat(prompt: str):
@@ -24,40 +42,79 @@ async def chat(prompt: str):
     yield Done()
 ```
 
+That route survives client disconnects, streams resumably, is journaled for crash recovery, enforces a dollar budget and a deadline, and is simultaneously reachable over SSE, WebSocket, an OpenAI-compatible endpoint and MCP. You wrote six lines.
+
+## Quick start
+
 ```bash
-uvicorn examples.research_agent:app --port 8000
-curl -N localhost:8000/research -X POST \
-     -H 'content-type: application/json' -d '{"topic": "event logs"}'
+pip install -e ".[dev]"
+uvicorn examples.agent:app --port 8000
+
+curl -N localhost:8000/agent -X POST -H 'content-type: application/json' \
+     -d '{"task": "create hello.txt containing a haiku"}'
 ```
+
+Or the whole stack with Postgres and Redis:
+
+```bash
+docker compose up
+```
+
+## See it work
+
+<table>
+<tr>
+<td width="50%" valign="top">
+
+**Human approval that survives a restart**
+
+The policy says `write_file` needs a human. The run pauses — through `ctx.pause()`, so on a durable run the process can *exit* while it waits — and resumes the moment the signal arrives.
+
+<img src="docs/assets/human-approval.gif" alt="An agent pauses for human approval and resumes on a signal" width="100%">
+
+</td>
+<td width="50%" valign="top">
+
+**Crash mid-run, resume on another worker**
+
+`kill -9` the worker at a pause. A fresh process claims the run from the journal, replays it — the expensive step returns its journaled result and is **not** re-executed — and carries on.
+
+<img src="docs/assets/crash-recovery.gif" alt="A worker is killed mid-run; a fresh worker recovers it from the journal with no duplicated side effects" width="100%">
+
+</td>
+</tr>
+</table>
+
+Both are renders of real sessions captured while building the project; regenerate them with `python docs/assets/render_demos.py`.
+
+## Architecture
+
+<img src="docs/assets/architecture.svg" alt="agentapi architecture: transports attach to a run; the run owns an event log, context and steps; an agent loop drives built-in tools, skills and MCP tools through one policy gate" width="100%">
 
 ## What you get
 
-| Problem with request-shaped servers | What agentapi does |
+| The problem with request-shaped servers | What agentapi does |
 |---|---|
-| Client disconnect kills the generation you already paid for | `on_disconnect="detach" \| "cancel" \| "drain"` — a per-route policy, not a framework decree |
-| Streams can't resume; no late joiners; one viewer per response | Every run writes an append-only **event log**; any number of clients attach by cursor: `GET /runs/{id}/events?from=42` (or `Last-Event-ID`) |
-| No budget/cost model | `budget_usd=` / `budget_tokens=` per route, nested `ctx.budget(...)` scopes; `BudgetExceeded` raises **at the call site**, mid-stream, not on the invoice |
-| No deadline propagation | `deadline="120s"` shrinks monotonically through every LLM call, tool, step and nested scope |
-| Backends melt under uncontrolled concurrency | `app.pool(...)` admission control with **deadline-aware shedding**: reject with `429 + Retry-After` *now* instead of timing out later |
+| Disconnect kills the generation you paid for | `on_disconnect="detach" \| "cancel" \| "drain"` — a per-route policy, not a framework decree |
+| Streams can't resume; one viewer per response | Append-only **event log** per run; any number of clients attach by cursor or `Last-Event-ID` |
+| No budget or cost model | `budget_usd=` / `budget_tokens=`, nested `ctx.budget()` scopes; `BudgetExceeded` raises **mid-stream at the call site**, not on the invoice |
+| No deadline propagation | `deadline="120s"` shrinks monotonically through every LLM call, tool, step and scope |
+| Backends melt under load | Pools with per-tenant **fair queueing** and **deadline-aware shedding**: `429 + Retry-After` *now* rather than a timeout later; capacity adapts to upstream 429s |
 | Human-in-the-loop is impossible mid-request | `await ctx.pause("approval", schema=Approval, timeout="24h")` → resumed by `POST /runs/{id}/signals/approval` |
-| Retried steps re-execute side effects | `@step(retries=3, timeout="30s")` — journaled per run, memoized on re-entry |
-| The same function is hand-declared 3× (HTTP, LLM tool, MCP) | `@app.op` — one signature+docstring → HTTP route, Anthropic/OpenAI tool defs (`GET /llm/tools`), and an MCP server (`POST /mcp`) |
-| Expensive double-fired requests | `Idempotency-Key` honoured on run creation |
-| Observability bolted on per project | Lifecycle **hooks** (`on_run_start/on_event/on_run_end/on_tool_call/on_llm_call/...`); hook failures never kill a run |
-| Half-streamed JSON can't be validated | `ctx.llm.stream_as(Invoice, ...)` yields a `PartialModel` per delta — fields fill in as tokens arrive — with a bounded repair loop if it never validates |
-| `x-tenant-id` trusted as sent | Pluggable `@app.authenticator` → `Principal`; the principal's tenant is authoritative, every run records its owner, and run endpoints enforce it (404, not 403, so existence can't be probed) |
-| Conversations bounce between backends, losing the KV cache | `app.sessions([...])` — sticky session affinity plus prefix-cache-aware placement, with a measurable hit rate on `GET /sessions` |
-| The journal stores prompts and secrets verbatim, forever | `redactor=Redactor()` masks secrets, PII and named fields **on the way into** the journal — the live stream is untouched, and redacted journals still recover |
-| One caller can exhaust the process | `rate_limit=RateLimit(per_minute=60)` — token bucket keyed by tenant (or principal), overridable per route, 429 with a computed `Retry-After` |
-| A run can only be tailed on the worker that owns it | `fanout="redis://..."` mirrors events to Redis Streams, so **any** worker serves the same resumable stream for **any** run |
-| Traces, prompt logs and the request live in three systems | `instrument(app)` — one OTEL span per run, children per step/tool/LLM call, all keyed by `agentapi.run_id`; prompts stay out unless you opt in |
-| Capabilities copy-pasted between services | **Skills**: instructions + ops + hooks in one mountable bundle, loadable from a `SKILL.md` directory; skill instructions become the agent loop's system prompt |
-| Every project rewrites the model↔tools loop | `await app.agent(model=..., messages=...)` — Anthropic-format tool loop over your ops; tool calls/results land in the event log, budgets and deadlines apply per turn |
-| Process crash loses hours of agent work | `AgentAPI(durable="runs.db")` + `durability="durable"` routes: SQLite journal of events, steps and signals; `app.recover()` replays unfinished runs — completed steps don't re-execute, past signals re-deliver, history isn't duplicated |
+| Process crash loses hours of agent work | SQLite or **Postgres journal**; `app.recover()` replays — steps don't re-execute, signals re-deliver, history isn't duplicated, any worker can claim a run |
+| Replay-based recovery silently corrupts on nondeterminism | **Runtime determinism checker**: `time`/`random`/`uuid` outside a step raise at the offending line; replay divergence is detected, not ignored |
+| Same function declared 3× (HTTP, LLM tool, MCP) | `@app.op` — one signature+docstring → HTTP route, Anthropic/OpenAI tool defs, MCP tool |
+| Every project rewrites the model↔tools loop | `await app.agent(...)` — tool calls land in the event log, budgets apply per turn |
+| Half-streamed JSON can't be validated | `ctx.llm.stream_as(Invoice)` yields a `PartialModel` per delta, with a bounded repair loop |
+| `x-tenant-id` trusted as sent | Pluggable authenticator; tenant is authoritative; cross-tenant access is a **404**, not a 403 |
+| Journal stores prompts and secrets forever | `Redactor` masks credentials, PII and named fields **on the way in** |
+| One caller exhausts the process | Per-principal token-bucket rate limiting, overridable per route |
+| A run can only be tailed on its owning worker | Redis Streams fanout: **any** worker serves **any** run |
+| Traces, logs and requests live in three systems | OTEL spans, Prometheus `/metrics`, JSON logs — all keyed by `run_id` |
+| Rolling deploys kill runs | Graceful shutdown drains in-flight work; `/readyz` reports draining so the pod leaves the LB first |
+| Production runs can't be reproduced | `agentapi replay <run_id>` re-executes offline against journaled LLM responses — a free regression test |
 
-## Agent harness
-
-A sandboxed coding agent, wired to everything above:
+## Build an agent on it
 
 ```python
 harness = attach_harness(
@@ -66,222 +123,66 @@ harness = attach_harness(
     policy=Policy(default="ask").allow("read_file", "grep", "glob"),
     skills_dir="./skills",
 )
+await harness.connect_mcp("github", command=["npx", "-y", "@modelcontextprotocol/server-github"])
 ```
 
-That gives a durable run route with a real model-tools loop over a
-**sandboxed toolset** (`bash`, `read_file`, `write_file`, `edit_file`,
-`grep`, `glob`, `list_dir`), each registered as an op — so every tool is
-also an HTTP endpoint and an MCP tool.
+**Sandbox.** Every path resolves (symlinks *first*) inside the workspace or is refused. Commands run under CPU/memory/process/file-size rlimits with a timeout that kills the process *group*. The environment is scrubbed, so credentials in the server's environment are invisible to model-authored commands. Output is capped. This narrows blast radius for a cooperative agent — for genuinely hostile code, still run the server in a container.
 
-**Sandbox.** Every path resolves (symlinks included) inside the workspace
-or is refused; commands run under CPU/memory/process/file-size rlimits with
-a wall-clock timeout that kills the process *group*; the environment is
-scrubbed, so credentials in the server's environment are invisible to
-model-authored commands; output is capped so a runaway command cannot flood
-the context window. This narrows blast radius for a cooperative agent — for
-genuinely hostile code, still run the server in a container.
+**One policy gate for everything.** `allow` / `deny` / `ask`, matched on tool name and argument patterns, deny-first. Built-in tools, skill scripts and **MCP tools all pass through the same gate** — a third-party tool is not more trusted than a local one. An `ask` escalates through `ctx.pause()`, so approval survives a process restart.
 
-**Policy with approval that survives a crash.** Rules are `allow` / `deny` /
-`ask`, matched on tool name and argument patterns, deny-first so a broad
-`allow("*")` cannot outrank a specific `deny`. An `ask` escalates through
-`ctx.pause()` — which means on a durable run **the process may exit while
-an approval is pending** and resume when the answer arrives. Approval
-prompts dying because a worker restarted is the usual reason teams abandon
-human-in-the-loop; here that failure mode does not exist.
+**MCP in both directions.** agentapi serves MCP *and* consumes it. Adopted tools become `server__tool` ops with the server's own schema; stdio servers run as subprocesses with a scrubbed environment and resource limits; a server that dies or hangs degrades to a tool error the model can route around.
 
-**MCP in both directions.** agentapi already *serves* MCP; it is now also a
-*client*, so an agent can borrow tools from other servers:
-
-```python
-await harness.connect_mcp("github", command=["npx", "-y",
-                                             "@modelcontextprotocol/server-github"])
-await harness.connect_mcp("internal", url="https://tools.internal/mcp")
-```
-
-Discovered tools become ops named `server__tool` and inherit **everything**
-a local tool gets: permission policy (including human approval that
-survives a restart), event-log entries, usage accounting, budgets and
-deadlines. A third-party tool is not more trusted than a local one —
-arguably less. stdio servers launch as subprocesses under resource limits
-with a **scrubbed environment**, so an MCP server never inherits the API
-keys in the host's environment; pass what it needs explicitly with `env=`.
-A server that dies, hangs or returns garbage degrades to a tool error the
-model can read, never an exception that kills the run.
-
-**Skill scripts run sandboxed.** Skills often ship a helper — a linter, a
-converter — better executed than reimplemented by the model each turn.
-`run_skill_script` runs it under the same containment as every other
-command, jailed to the skill's own directory.
-
-**Progressive disclosure for skills.** `Skill.discover(dir)` loads a tree of
-`SKILL.md` directories (the same convention Claude Code uses). The system
-prompt carries only names and descriptions; the agent calls `load_skill`
-for a body when a task needs it, so a dozen skills don't crowd out the
-conversation. Bundled files are readable via `read_skill_resource`, jailed
-to the skill's own directory.
-
-See [`examples/agent.py`](examples/agent.py) for a complete one.
-
-## Authentication
-
-Without an authenticator the app is open — the same as FastAPI with no
-dependencies. Register one and tenancy is enforced everywhere:
-
-```python
-@app.authenticator
-async def authenticate(request):
-    record = await lookup(request.headers.get("authorization"))
-    return None if record is None else Principal(
-        id=record.user, tenant=record.org)
-```
-
-The principal's tenant **overrides** any client-sent header, runs record
-their owner at creation, idempotency keys are scoped per tenant, and another
-tenant asking about your run gets a 404 rather than a 403. Pass
-`require_auth=True` to turn "no authenticator registered" into a startup
-error instead of a silent hole.
+**Skills, progressively disclosed.** `Skill.discover(dir)` loads a tree of `SKILL.md` directories — the same convention Claude Code uses. The prompt carries names and descriptions; `load_skill` fetches a body on demand; bundled scripts run sandboxed.
 
 ## Performance vs FastAPI
 
-Measured, not asserted (`python benchmarks/bench.py`, full numbers in
-[BENCHMARKS.md](BENCHMARKS.md)):
+Measured, not asserted (`python benchmarks/bench.py`, details in [BENCHMARKS.md](BENCHMARKS.md)):
 
 | Scenario | FastAPI | agentapi |
 |---|---|---|
 | JSON request/response | 396 req/s | 397 req/s — **tie** |
-| SSE streaming (40 events) | 237 req/s | 196 req/s — **FastAPI wins by ~17%** |
-| Client hangs up mid-stream | work is gone | run completes, 41 events replayable |
+| SSE streaming, 40 events | 237 req/s | 196 req/s — **FastAPI wins ~17%** |
+| Client hangs up mid-stream | work is gone | run completes; 41 events replayable |
 
-The streaming gap is real: appending to a log, sequencing and serialising
-each event costs ~0.3 ms per event. That is the price of resumability, and
-it is 0.1%–0.01% of a real LLM turn. Routes that need none of it can opt out
-with `durability="ephemeral"`.
-
-## Production
-
-See **[PRODUCTION.md](PRODUCTION.md)** for the deployment guide, the
-configuration you should set, and an explicit list of what is *not* yet
-verified.
-
-```bash
-docker compose up          # app + postgres + redis
-```
-
-```python
-app = AgentAPI.from_env(llm=AnthropicLLM())   # 12-factor config
-```
-
-Operational surface: `/healthz` (liveness, ignores dependencies so a
-database blip is not a crash loop), `/readyz` (readiness — checks the
-journal, reports `draining`), `/metrics` (Prometheus), JSON logs keyed by
-run id, and graceful shutdown that drains in-flight runs on SIGTERM while
-*not* waiting on runs parked for human approval.
+The streaming gap is real — sequencing and serialising each event costs ~0.3ms — and it is 0.1–0.01% of a real LLM turn. Routes that need none of it opt out with `durability="ephemeral"`.
 
 ## Surfaces
 
 ```
-POST /{route}                  create a run (SSE stream; ?stream=false to block)
-GET  /runs/{id}                status + usage
-GET  /runs/{id}/events         resumable SSE (?from= cursor / Last-Event-ID)
-WS   /ws/runs/{id}             bidirectional: events out, signals/cancel in
-POST /runs/{id}/signals/{s}    deliver a human-in-the-loop signal
-POST /runs/{id}/cancel         cancel (interrupts in-flight awaits)
-POST /v1/chat/completions      OpenAI-compatible (app.openai_compat("/chat"))
-GET  /ops                      op catalog          GET /llm/tools   tool defs
-POST /mcp                      MCP server          GET /skills      skills
-GET  /pools                    admission stats     GET /sessions    routing
-GET  /healthz                  liveness            GET /readyz      readiness
-GET  /metrics                  Prometheus          GET /mcp/servers connected
+POST /{route}                  create a run (SSE; ?stream=false blocks)
+GET  /runs/{id}/events         resumable SSE (?from= / Last-Event-ID)
+WS   /ws/runs/{id}             events out, signals / cancel / drain in
+POST /runs/{id}/signals/{s}    human-in-the-loop signal
+POST /v1/chat/completions      OpenAI-compatible
+POST /mcp                      MCP server        GET /mcp/servers  connected clients
+GET  /llm/tools                tool definitions  GET /ops          catalog
+GET  /healthz  /readyz         probes            GET /metrics      Prometheus
 ```
 
-Already have a FastAPI service? Adopt per route instead of rewriting:
+Have an existing FastAPI app? `app.mount("/legacy", fastapi_app)` — adopt per route, not by rewrite.
 
-```python
-app.mount("/legacy", existing_fastapi_app)
-```
+## Production
 
-## Replay and eval
+**[PRODUCTION.md](PRODUCTION.md)** is the deployment guide: the configuration to set, the details that bite (LB idle timeouts, shutdown ordering, which probe goes where, journal growth), and — deliberately — an explicit list of what is **not** yet verified.
 
-The journal records every event, step result and LLM exchange, so a
-production run is already a reproducible test case:
+The short version of that list: `AnthropicLLM` has been exercised far less than everything else. Every test in the suite runs on `MockLLM`. **If you run this against a real model, [tell us what happened](https://github.com/Joshuaakaspace/agentapi/issues/new?template=live_model_report.yml)** — a live report is the most valuable contribution the project can receive right now.
+
+## Contributing
+
+This project is young and moving fast, which means your contribution has an outsized effect on where it ends up. Start with [CONTRIBUTING.md](CONTRIBUTING.md); the quickest wins are a [live model report](https://github.com/Joshuaakaspace/agentapi/issues/new?template=live_model_report.yml), a `good first issue`, a new skill under `examples/skills/`, or an MCP server integration.
 
 ```bash
-agentapi runs   --app myapp:app          # list recorded runs
-agentapi show   run_abc --app myapp:app  # full event history
-agentapi replay run_abc --app myapp:app  # re-run offline against recorded
-                                         # LLM responses; reports divergence
-agentapi eval   cases.json --app myapp:app
+pip install -e ".[dev]" && pytest -q && ruff check agentapi tests benchmarks
 ```
 
-`replay` never touches the provider — it feeds journaled responses back in,
-so regression-testing a prompt change against real traffic costs nothing.
+If the Run-not-Request idea resonates, a ⭐ helps other people find it.
 
-## Durability tiers
-
-| `durability=` | Survives | Backing |
-|---|---|---|
-| `ephemeral` | nothing (classic request) | — |
-| `resumable` (default) | client disconnects, reattach, replay | in-memory event log |
-| `durable` | **process crashes**, deploys, long HITL pauses | SQLite journal (`AgentAPI(durable="runs.db")`) or Postgres (`AgentAPI(durable="postgresql://...")`) |
-
-On Postgres several workers share one journal, so any worker can resume a
-run whose original process died. `claim_runs` makes that safe with an
-atomic `UPDATE ... RETURNING` behind a lease: two workers recovering at the
-same instant cannot both resume a run and double its side effects.
-
-Recovery is replay-based: `app.recover()` re-executes unfinished durable
-runs from the top — `@step` results return from the journal instead of
-re-running side effects, past signals re-deliver the same payloads, and
-re-emitted events are deduplicated against persisted history.
-
-### Determinism is checked, not just documented
-
-Replay only works if a handler re-run takes the same path. A stray
-`time.time()` would silently corrupt the journal, so the runtime catches it
-two ways:
-
-- **Proactively** — `time`/`random`/`uuid` calls made inside a durable
-  handler *outside a step* raise `NondeterminismError` at the offending
-  line, naming the fix. The wrappers are inert everywhere else: they act
-  only on tasks running durable handler code, so other threads, tasks and
-  libraries are untouched.
-- **Reactively** — during recovery, an emitted event matching nothing in
-  the remaining history proves divergence, whatever the cause (`datetime.now()`,
-  dict ordering, an unjournaled read). The run fails loudly instead of
-  writing a corrupt journal.
-
-`ctx.now()`, `ctx.uuid()` and `ctx.random()` are **journaled**: a recovered
-run sees the same clock, ids and dice as the execution it resumes. Anything
-else nondeterministic belongs inside a `@step`, whose result is journaled.
-
-Set the policy with `AgentAPI(determinism="raise" | "warn" | "off")`
-(default `"raise"`; applies to durable runs only).
+<div align="center">
+<a href="https://star-history.com/#Joshuaakaspace/agentapi&Date"><img src="https://api.star-history.com/svg?repos=Joshuaakaspace/agentapi&type=Date" alt="Star history" width="600"></a>
+</div>
 
 ## Status
 
-Working core with a 144-test suite: run lifecycle, resume-by-cursor,
-detach/cancel/drain policies, budgets, deadlines, pause/signal, steps, all
-three op surfaces, the agent loop, hooks, skills, fair-queueing pools, crash
-recovery (incl. crash-mid-stream with no duplicated events), determinism
-checking, WebSocket and OpenAI-compatible transports, partial validation,
-the replay CLI, authentication and tenant isolation, a Postgres journal
-(exercised against a real server, including multi-worker claim), session
-affinity with prefix-cache routing, OpenTelemetry tracing, journal
-redaction, per-principal rate limiting, cross-worker event fanout, and the
-sandboxed agent harness (containment, tool policy, approvals, skills), and
-the operational surface (probes, metrics, graceful shutdown, 12-factor
-config), and MCP client support with sandboxed skill scripts.
-CI runs the suite on Python 3.11-3.13 against real Postgres and Redis
-services, plus ruff.
+144 tests across run lifecycle, resume-by-cursor, disconnect policies, budgets, deadlines, pause/signal, steps, all op surfaces, the agent loop, hooks, skills, fair-queueing pools, crash recovery on SQLite *and* Postgres (including crash-mid-stream with no duplicated events), determinism checking, WebSocket and OpenAI-compatible transports, partial validation, the replay CLI, auth and tenant isolation, session routing, OTEL tracing, redaction, rate limiting, Redis fanout, the sandboxed harness, MCP client against real subprocess servers, and the operational surface. CI runs on Python 3.11–3.13 against real Postgres and Redis.
 
-**`AnthropicLLM` has never been run against the live API.** Every test uses
-`MockLLM`, so the real provider path — SSE parsing, error handling, retries
-— is unverified. That is the largest remaining unknown in the project.
-
-Also not built: multi-region/replicated journals, a UI for browsing runs,
-and streaming tool-call deltas (tool calls are dispatched only once the
-model's turn completes).
-
-```bash
-pip install -e ".[dev]" && pytest
-```
+Read the full rationale in [DESIGN.md](DESIGN.md). MIT licensed.
