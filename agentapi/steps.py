@@ -8,12 +8,14 @@ from __future__ import annotations
 
 import asyncio
 import functools
+import hashlib
 import inspect
 import json
-import hashlib
-from typing import Any, Callable, Optional, TypeVar
+from collections.abc import Callable
+from typing import Any, TypeVar
 
-from .context import get_ctx, parse_duration
+from .context import _step_depth, get_ctx, parse_duration
+from .determinism import suppressed
 
 F = TypeVar("F", bound=Callable[..., Any])
 
@@ -26,9 +28,9 @@ def _step_key(name: str, args: tuple, kwargs: dict) -> str:
     return f"{name}:{hashlib.sha256(payload.encode()).hexdigest()[:16]}"
 
 
-def step(fn: Optional[F] = None, *, retries: int = 0,
-         backoff: float = 0.5, timeout: Optional[str | float] = None,
-         name: Optional[str] = None) -> Any:
+def step(fn: F | None = None, *, retries: int = 0,
+         backoff: float = 0.5, timeout: str | float | None = None,
+         name: str | None = None) -> Any:
     """Wrap a coroutine function as a journaled, retryable step.
 
         @step(retries=3, timeout="30s")
@@ -50,13 +52,22 @@ def step(fn: Optional[F] = None, *, retries: int = 0,
             if key in journal:
                 return journal[key]
             timeout_s = None if timeout is None else parse_duration(timeout)
-            last_exc: Optional[BaseException] = None
+            last_exc: BaseException | None = None
             for attempt in range(retries + 1):
                 context.check()
                 try:
-                    coro = func(*args, **kwargs)
-                    result = (await asyncio.wait_for(coro, timeout_s)
-                              if timeout_s else await coro)
+                    # A step's result is journaled, so nondeterminism
+                    # inside it is fine — that is the entire point of steps.
+                    # The depth token also tells a draining run not to stop
+                    # mid-step: "drain" finishes the current step first.
+                    depth = _step_depth.set(_step_depth.get() + 1)
+                    try:
+                        with suppressed():
+                            coro = func(*args, **kwargs)
+                            result = (await asyncio.wait_for(coro, timeout_s)
+                                      if timeout_s else await coro)
+                    finally:
+                        _step_depth.reset(depth)
                     journal[key] = result
                     if context._step_commit is not None:
                         context._step_commit(key, result)

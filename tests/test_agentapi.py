@@ -7,8 +7,17 @@ import httpx
 import pytest
 from pydantic import BaseModel
 
-from agentapi import (AgentAPI, BudgetExceeded, Done, MockLLM, Skill,
-                      StateDelta, Token, ctx, step)
+from agentapi import (
+    AgentAPI,
+    BudgetExceeded,
+    Done,
+    MockLLM,
+    Skill,
+    StateDelta,
+    Token,
+    ctx,
+    step,
+)
 
 pytestmark = pytest.mark.asyncio
 
@@ -524,7 +533,6 @@ async def test_pool_limits_concurrency():
 
 async def test_pool_deadline_aware_shedding():
     from agentapi import PoolSaturated
-    pool = Pool = None
     from agentapi.pools import Pool
     pool = Pool("tiny", concurrency=1, avg_latency_s=10.0)
 
@@ -779,3 +787,381 @@ async def test_archived_run_readable_from_journal_after_restart(tmp_path):
     assert info["archived"] is True and info["status"] == "completed"
     assert events["closed"] is True
     assert [e["type"] for e in events["events"]][-1] == "done"
+
+
+# --- determinism checking -------------------------------------------------
+
+async def test_raw_clock_in_durable_handler_is_rejected(tmp_path):
+    import time as time_module
+
+    app = AgentAPI(llm=MockLLM(), durable=str(tmp_path / "d.db"))
+
+    @app.run("/sloppy", durability="durable")
+    async def sloppy():
+        yield StateDelta(data={"stamped": time_module.time()})  # not replayable
+        yield Done()
+
+    async with client_for(app) as client:
+        async with client.stream("POST", "/sloppy", json={}) as response:
+            events = await sse_events(response)
+    assert events[-1]["event"] == "error"
+    assert events[-1]["data"]["kind"] == "nondeterminism"
+    assert "time.time" in events[-1]["data"]["error"]
+    assert "ctx.now()" in events[-1]["data"]["error"]   # names the remedy
+
+
+async def test_raw_randomness_and_uuid_are_rejected(tmp_path):
+    import random as random_module
+    import uuid as uuid_module
+
+    for label, offender in (("random", lambda: random_module.random()),
+                            ("uuid", lambda: str(uuid_module.uuid4()))):
+        app = AgentAPI(llm=MockLLM(), durable=str(tmp_path / f"{label}.db"))
+
+        @app.run("/x", durability="durable")
+        async def handler(_offender=offender):
+            yield StateDelta(data={"v": _offender()})
+            yield Done()
+
+        async with client_for(app) as client:
+            async with client.stream("POST", "/x", json={}) as response:
+                events = await sse_events(response)
+        assert events[-1]["data"]["kind"] == "nondeterminism", label
+
+
+async def test_ctx_accessors_and_steps_are_allowed(tmp_path):
+    import time as time_module
+
+    app = AgentAPI(llm=MockLLM(), durable=str(tmp_path / "ok.db"))
+
+    @step
+    async def stamped() -> float:
+        return time_module.time()      # fine: a step's result is journaled
+
+    @app.run("/clean", durability="durable")
+    async def clean():
+        yield StateDelta(data={
+            "now": ctx.now(), "uuid": ctx.uuid(), "rand": ctx.random(),
+            "step": await stamped(),
+        })
+        yield Done(result="clean")
+
+    async with client_for(app) as client:
+        async with client.stream("POST", "/clean", json={}) as response:
+            events = await sse_events(response)
+    assert events[-1]["event"] == "done"
+    assert events[-1]["data"]["result"] == "clean"
+
+
+async def test_checker_is_inert_outside_durable_runs():
+    import time as time_module
+
+    app = AgentAPI(llm=MockLLM())          # no journal -> nothing to corrupt
+
+    @app.run("/loose")                      # default durability="resumable"
+    async def loose():
+        yield StateDelta(data={"t": time_module.time()})
+        yield Done(result="fine")
+
+    async with client_for(app) as client:
+        async with client.stream("POST", "/loose", json={}) as response:
+            events = await sse_events(response)
+    assert events[-1]["data"]["result"] == "fine"
+    # and plain module use outside any run is untouched
+    assert isinstance(time_module.time(), float)
+
+
+async def test_warn_mode_records_violation_without_failing(tmp_path):
+    import time as time_module
+
+    app = AgentAPI(llm=MockLLM(), durable=str(tmp_path / "w.db"),
+                   determinism="warn")
+
+    @app.run("/noisy", durability="durable")
+    async def noisy():
+        yield StateDelta(data={"t": time_module.time()})
+        yield Done(result="survived")
+
+    with pytest.warns(RuntimeWarning, match="nondeterministic"):
+        async with client_for(app) as client:
+            async with client.stream("POST", "/noisy", json={}) as response:
+                events = await sse_events(response)
+    assert events[-1]["data"]["result"] == "survived"
+
+
+async def test_ctx_now_replays_the_recorded_timestamp(tmp_path):
+    """The bug this fixes: ctx.now() used to return live wall clock, so a
+    recovered run saw a different 'now' than the execution it replaced."""
+    db = tmp_path / "now.db"
+
+    def build():
+        app = AgentAPI(llm=MockLLM(), durable=str(db))
+
+        class Approval(BaseModel):
+            approved: bool
+
+        @app.run("/stamp", durability="durable")
+        async def stamp():
+            yield StateDelta(data={"started": ctx.now(), "id": ctx.uuid()})
+            approval = await ctx.pause("approval", schema=Approval,
+                                       timeout="60s")
+            yield Done(result={"started": ctx.now(), "ok": approval.approved})
+        return app
+
+    app1 = build()
+    async with live_app(app1) as client:
+        async with client.stream("POST", "/stamp", json={}) as response:
+            run_id = response.headers["x-run-id"]
+            async for line in response.aiter_lines():
+                if line.startswith("event: paused"):
+                    break
+    first = app1.runs.get(run_id).log.read(0)[0].data
+    app1.runs.get(run_id).durable = False
+    app1.runs.get(run_id).task.cancel()
+    try:
+        await app1.runs.get(run_id).task
+    except (asyncio.CancelledError, Exception):
+        pass
+
+    await asyncio.sleep(0.01)              # ensure wall clock has moved on
+    app2 = build()
+    app2.recover()
+    run2 = app2.runs.get(run_id)
+    app2.runs.signal(run_id, "approval", {"approved": True})
+    await asyncio.wait_for(run2.task, timeout=2)
+    assert run2.status.value == "completed"
+
+    replayed = run2.log.read(0)[0].data
+    assert replayed["started"] == first["started"]   # same clock, not "now"
+    assert replayed["id"] == first["id"]             # same id
+
+
+async def test_replay_divergence_is_detected(tmp_path):
+    """Reactive half: even nondeterminism the patches cannot see (here, an
+    external mutable) is caught when the replay stops matching history."""
+    db = tmp_path / "div.db"
+    path_choice = {"value": "left"}
+
+    def build():
+        app = AgentAPI(llm=MockLLM(), durable=str(db))
+
+        class Approval(BaseModel):
+            approved: bool
+
+        @app.run("/forky", durability="durable")
+        async def forky():
+            yield StateDelta(data={"branch": path_choice["value"]})
+            approval = await ctx.pause("approval", schema=Approval,
+                                       timeout="60s")
+            yield Done(result=approval.approved)
+        return app
+
+    app1 = build()
+    async with live_app(app1) as client:
+        async with client.stream("POST", "/forky", json={}) as response:
+            run_id = response.headers["x-run-id"]
+            async for line in response.aiter_lines():
+                if line.startswith("event: paused"):
+                    break
+    app1.runs.get(run_id).durable = False
+    app1.runs.get(run_id).task.cancel()
+    try:
+        await app1.runs.get(run_id).task
+    except (asyncio.CancelledError, Exception):
+        pass
+
+    path_choice["value"] = "right"        # the world changed under the replay
+    app2 = build()
+    app2.recover()
+    run2 = app2.runs.get(run_id)
+    await asyncio.wait_for(run2.task, timeout=2)
+    assert run2.status.value == "failed"
+    terminal = run2.log.read(0)[-1]
+    assert terminal.kind == "nondeterminism"
+    assert "diverged" in terminal.error
+
+
+# --- drain policy ---------------------------------------------------------
+
+async def test_drain_finishes_current_step_then_stops():
+    app = AgentAPI(llm=MockLLM())
+    progress = []
+    in_step = asyncio.Event()
+    let_step_finish = asyncio.Event()
+
+    @step
+    async def slow_step():
+        in_step.set()
+        await let_step_finish.wait()
+        progress.append("step-finished")
+        return "done-work"
+
+    @app.run("/drainable", on_disconnect="drain")
+    async def drainable():
+        yield Token(text="start")
+        await slow_step()
+        progress.append("after-step")
+        yield Token(text="more")          # drain stops the run here
+        progress.append("emitted-more")   # unreachable
+        yield Done(result="full")
+
+    async with live_app(app) as client:
+        async with client.stream("POST", "/drainable", json={}) as response:
+            run_id = response.headers["x-run-id"]
+            async for _ in response.aiter_lines():
+                break
+            await asyncio.wait_for(in_step.wait(), timeout=2)
+        await asyncio.sleep(0.05)          # disconnect registered -> drain
+        let_step_finish.set()
+        run = app.runs.get(run_id)
+        await asyncio.wait_for(run.task, timeout=2)
+
+    # The in-flight step ran to completion rather than being interrupted,
+    # and the run then stopped at the next checkpoint (the emit) — so no
+    # further output reached the log.
+    assert progress == ["step-finished", "after-step"]
+    assert "emitted-more" not in progress
+    assert run.status.value == "completed"  # graceful stop, not an error
+    assert [e.type for e in run.log.read(0)] == ["token", "done"]
+
+
+async def test_ctx_draining_flag_visible_to_handlers():
+    app = AgentAPI(llm=MockLLM())
+    seen = {}
+
+    @app.run("/loop", on_disconnect="drain")
+    async def looper():
+        for i in range(100):
+            if ctx.draining:               # handler-controlled early exit
+                seen["stopped_at"] = i
+                break
+            yield Token(text=str(i))
+            await asyncio.sleep(0.01)
+        yield Done(result=seen.get("stopped_at"))
+
+    async with live_app(app) as client:
+        async with client.stream("POST", "/loop", json={}) as response:
+            run_id = response.headers["x-run-id"]
+            async for _ in response.aiter_lines():
+                break
+        run = app.runs.get(run_id)
+        await asyncio.wait_for(run.task, timeout=3)
+    assert 0 < seen["stopped_at"] < 100
+
+
+# --- pool fair queueing and adaptive capacity -----------------------------
+
+async def test_pool_fair_queueing_across_tenants():
+    """One tenant flooding the queue must not starve another."""
+    from agentapi.pools import Pool
+    pool = Pool("shared", concurrency=1)
+    order = []
+
+    async def work(tenant, tag):
+        async with pool.acquire(tenant=tenant):
+            order.append(tag)
+            await asyncio.sleep(0.01)
+
+    async with pool.acquire(tenant="hold"):          # occupy the only slot
+        tasks = [asyncio.create_task(work("noisy", f"noisy{i}"))
+                 for i in range(5)]
+        await asyncio.sleep(0.01)
+        tasks.append(asyncio.create_task(work("quiet", "quiet0")))
+        await asyncio.sleep(0.01)
+    await asyncio.gather(*tasks)
+
+    # round robin: the quiet tenant is served second, not after all 5
+    assert order.index("quiet0") == 1, order
+
+
+async def test_pool_adapts_capacity_to_upstream_429():
+    from agentapi.pools import Pool
+    pool = Pool("adaptive", concurrency=8, recovery_after_s=0.0)
+    assert pool.effective_concurrency == 8
+
+    pool.report_upstream_429(retry_after=0.0)
+    assert pool.effective_concurrency == 4          # multiplicative decrease
+    pool.report_upstream_429(retry_after=0.0)
+    assert pool.effective_concurrency == 2
+    assert pool.stats()["effective_concurrency"] == 2
+
+    for _ in range(10):                              # additive increase back
+        pool.report_success()
+    assert pool.effective_concurrency > 2
+
+
+async def test_llm_429_shrinks_the_pool():
+    """A provider 429 during a real call feeds back into admission control."""
+    from agentapi.pools import Pool
+
+    class Boom(Exception):
+        def __init__(self):
+            self.response = type("R", (), {"status_code": 429,
+                                           "headers": {"retry-after": "0"}})()
+
+    class FailingLLM(MockLLM):
+        async def _complete(self, **kwargs):
+            raise Boom()
+
+    pool = Pool("upstream", concurrency=8, recovery_after_s=0.0)
+    app = AgentAPI(llm=FailingLLM(pool=pool))
+
+    @app.run("/hits429")
+    async def hits429():
+        await ctx.llm.complete(model="mock", messages=[
+            {"role": "user", "content": "x"}])
+        yield Done()
+
+    async with client_for(app) as client:
+        async with client.stream("POST", "/hits429", json={}) as response:
+            events = await sse_events(response)
+    assert events[-1]["event"] == "error"
+    assert pool.effective_concurrency == 4      # capacity shrank on the 429
+
+
+# --- OpenAI-compatible surface --------------------------------------------
+
+def openai_app():
+    app = AgentAPI(llm=MockLLM(script=["hello there friend"]))
+
+    @app.run("/chat")
+    async def chat(messages: list = None, model: str = "mock"):
+        async for tok in ctx.llm.stream(model=model, messages=messages or []):
+            yield Token(text=tok)
+        yield Done()
+
+    app.openai_compat("/chat")
+    return app
+
+
+async def test_openai_compat_non_streaming():
+    app = openai_app()
+    async with client_for(app) as client:
+        response = await client.post("/v1/chat/completions", json={
+            "model": "gpt-4o", "messages": [
+                {"role": "user", "content": "hi"}]})
+    body = response.json()
+    assert body["object"] == "chat.completion"
+    assert body["choices"][0]["message"]["content"].strip() == "hello there friend"
+    assert body["choices"][0]["finish_reason"] == "stop"
+    assert body["usage"]["completion_tokens"] == 3
+
+
+async def test_openai_compat_streaming_chunks():
+    app = openai_app()
+    async with live_app(app) as client:
+        async with client.stream("POST", "/v1/chat/completions", json={
+                "model": "gpt-4o", "stream": True,
+                "messages": [{"role": "user", "content": "hi"}]}) as response:
+            payloads = []
+            async for line in response.aiter_lines():
+                if line.startswith("data: "):
+                    payloads.append(line[6:])
+    assert payloads[-1] == "[DONE]"
+    chunks = [json.loads(p) for p in payloads[:-1]]
+    assert all(c["object"] == "chat.completion.chunk" for c in chunks)
+    text = "".join(c["choices"][0]["delta"].get("content", "") for c in chunks)
+    assert text.strip() == "hello there friend"
+    assert chunks[-1]["choices"][0]["finish_reason"] == "stop"
+
+

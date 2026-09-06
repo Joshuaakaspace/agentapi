@@ -27,33 +27,71 @@ Surfaces mounted automatically:
 from __future__ import annotations
 
 import asyncio
-import inspect
+import contextlib
 import json
-from typing import Any, Callable, Optional, get_type_hints
+import logging
+from collections.abc import Callable
+from typing import Any
 
-from pydantic import BaseModel
 from starlette.applications import Starlette
 from starlette.requests import Request
 from starlette.responses import JSONResponse, Response, StreamingResponse
-from starlette.routing import Route
+from starlette.routing import Mount, Route, WebSocketRoute
+from starlette.websockets import WebSocket, WebSocketDisconnect
 
+from .auth import ANONYMOUS, Authenticator, AuthError, Principal, owns
 from .context import RunContext, parse_duration
+from .determinism import MODES as DETERMINISM_MODES
 from .events import parse_event
 from .hooks import Hooks
 from .journal import SQLiteBackend
 from .llm import BaseLLM
 from .mcp import MCPServer
 from .ops import OpRegistry, _schema_from_signature
-from .pools import Pool, PoolSaturated
-from .run import RunManager, RunStatus
+from .pools import Pool
+from .ratelimit import RateLimit, RateLimited
+from .redaction import NullRedactor
+from .run import RunManager
+from .sessions import SessionRouter
 from .skills import Skill, SkillSet
+
+
+def _make_fanout(fanout: str | Any | None):
+    """``fanout=`` accepts a redis:// URL or a ready-made fanout object."""
+    if fanout is None:
+        return None
+    if isinstance(fanout, str):
+        from .fanout import RedisFanout
+        return RedisFanout(fanout)
+    return fanout
+
+
+def _make_backend(durable: str | Any | None):
+    """``durable=`` accepts a SQLite path, a postgres:// DSN, or a
+    ready-made backend object."""
+    if durable is None:
+        return None
+    if not isinstance(durable, str):
+        return durable                       # caller supplied a backend
+    if durable.startswith(("postgres://", "postgresql://")):
+        from .postgres import PostgresBackend
+        return PostgresBackend(durable)
+    return SQLiteBackend(durable)
+
+
+def _auth_response(exc: AuthError) -> JSONResponse:
+    headers = ({"WWW-Authenticate": "Bearer"}
+               if exc.status_code == 401 else None)
+    return JSONResponse({"error": str(exc)}, status_code=exc.status_code,
+                        headers=headers)
 
 
 class _RunRoute:
     def __init__(self, path: str, handler: Callable[..., Any], *,
-                 on_disconnect: str, deadline: Optional[float],
-                 budget_usd: Optional[float], budget_tokens: Optional[int],
-                 pools: list[Pool], durability: str) -> None:
+                 on_disconnect: str, deadline: float | None,
+                 budget_usd: float | None, budget_tokens: int | None,
+                 pools: list[Pool], durability: str,
+                 rate_limit: Any = None) -> None:
         self.path = path
         self.handler = handler
         self.on_disconnect = on_disconnect
@@ -62,32 +100,51 @@ class _RunRoute:
         self.budget_tokens = budget_tokens
         self.pools = pools
         self.durability = durability
+        self.rate_limit = rate_limit
         self.args_model, self.args_schema = _schema_from_signature(handler)
 
 
 class AgentAPI:
     def __init__(self, *, title: str = "agentapi", version: str = "0.1.0",
-                 llm: Optional[BaseLLM] = None,
+                 llm: BaseLLM | None = None,
                  retention_s: float = 3600.0,
-                 durable: Optional[str] = None) -> None:
+                 durable: str | None = None,
+                 determinism: str = "raise",
+                 require_auth: bool = False,
+                 redactor: Any = None,
+                 rate_limit: RateLimit | None = None,
+                 fanout: Any = None) -> None:
+        if determinism not in DETERMINISM_MODES:
+            raise ValueError(
+                f"determinism must be one of {DETERMINISM_MODES}")
+        self.determinism = determinism
+        self.require_auth = require_auth
+        self._authenticator: Authenticator | None = None
         self.title = title
         self.version = version
         self.llm = llm
-        self.backend = SQLiteBackend(durable) if durable else None
-        self.runs = RunManager(retention_s=retention_s, backend=self.backend)
+        self.backend = _make_backend(durable)
+        self.redactor = redactor or NullRedactor()
+        self.rate_limit = rate_limit
+        self.fanout = _make_fanout(fanout)
+        self.runs = RunManager(retention_s=retention_s, backend=self.backend,
+                               redactor=self.redactor, fanout=self.fanout)
         self.ops = OpRegistry()
         self.hooks = Hooks()
         self.skills = SkillSet()
         self.pools: dict[str, Pool] = {}
+        self.router: SessionRouter | None = None
         self._run_routes: dict[str, _RunRoute] = {}
-        self._asgi: Optional[Starlette] = None
+        self._mounts: list[tuple[str, Any]] = []
+        self._openai_route: str | None = None
+        self._asgi: Starlette | None = None
         self.mcp = MCPServer(title, self._McpOps(self), version)
         if llm is not None:
             llm.hooks = self.hooks
 
     class _McpOps:
         """Ops view for MCP that includes skill ops."""
-        def __init__(self, app: "AgentAPI") -> None:
+        def __init__(self, app: AgentAPI) -> None:
             self.app = app
 
         def mcp_tools(self) -> list[dict[str, Any]]:
@@ -108,11 +165,13 @@ class AgentAPI:
 
     # -- decorators ----------------------------------------------------------
     def run(self, path: str, *, on_disconnect: str = "detach",
-            deadline: Optional[str | float] = None,
-            budget_usd: Optional[float] = None,
-            budget_tokens: Optional[int] = None,
-            pools: Optional[list[Pool]] = None,
-            durability: str = "resumable") -> Callable[[Callable], Callable]:
+            deadline: str | float | None = None,
+            budget_usd: float | None = None,
+            budget_tokens: int | None = None,
+            pools: list[Pool] | None = None,
+            durability: str = "resumable",
+            rate_limit: RateLimit | None = None,
+            ) -> Callable[[Callable], Callable]:
         """Register a run handler. The handler is an async generator yielding
         Events (streaming) or a coroutine returning a result (request/response
         over the same run machinery)."""
@@ -130,13 +189,14 @@ class AgentAPI:
                 on_disconnect=on_disconnect,
                 deadline=None if deadline is None else parse_duration(deadline),
                 budget_usd=budget_usd, budget_tokens=budget_tokens,
-                pools=pools or [], durability=durability)
+                pools=pools or [], durability=durability,
+                rate_limit=rate_limit)
             return fn
         return decorate
 
-    def op(self, fn: Optional[Callable[..., Any]] = None, *,
-           name: Optional[str] = None, description: Optional[str] = None,
-           http: Optional[str] = None, llm_tool: bool = True,
+    def op(self, fn: Callable[..., Any] | None = None, *,
+           name: str | None = None, description: str | None = None,
+           http: str | None = None, llm_tool: bool = True,
            mcp: bool = True) -> Any:
         """Register a multi-surface op: HTTP + LLM tool + MCP from one
         signature."""
@@ -152,10 +212,60 @@ class AgentAPI:
             return func
         return decorate
 
+    def authenticator(self, fn: Authenticator) -> Authenticator:
+        """Register the function that turns a request into a Principal.
+
+        Returning None means "not authenticated" -> 401. The principal's
+        tenant is authoritative and overrides any client-sent header."""
+        self._authenticator = fn
+        return fn
+
+    async def _principal(self, request: Any) -> Principal:
+        """Resolve the caller. Raises AuthError for a rejected request."""
+        if self._authenticator is None:
+            if self.require_auth:
+                raise AuthError(
+                    "server requires authentication but no authenticator is "
+                    "registered", status_code=500)
+            return ANONYMOUS
+        principal = await self._authenticator(request)
+        if principal is None:
+            raise AuthError("invalid or missing credentials")
+        return principal
+
+    def _authorize_run(self, principal: Principal, run: Any) -> None:
+        if not owns(principal, run):
+            # 404, not 403: existence of another tenant's run is not
+            # something an unauthorised caller should be able to probe.
+            raise AuthError("run not found", status_code=404)
+
     def pool(self, name: str, **kwargs: Any) -> Pool:
         pool = Pool(name, **kwargs)
         self.pools[name] = pool
         return pool
+
+    def mount(self, path: str, app: Any) -> None:
+        """Mount any ASGI app (a FastAPI instance, Starlette, WSGI adapter)
+        under ``path``. The migration path: adopt agentapi per route instead
+        of rewriting a service."""
+        self._mounts.append((path, app))
+        self._asgi = None            # rebuild on next access
+
+    def openai_compat(self, route: str) -> None:
+        """Expose a run route as OpenAI-compatible ``/v1/chat/completions``.
+
+        The handler must accept a ``messages`` argument. Every existing
+        OpenAI client then works against it unchanged — streaming included."""
+        if route not in self._run_routes:
+            raise ValueError(f"unknown run route {route!r}")
+        self._openai_route = route
+        self._asgi = None
+
+    def sessions(self, backends: list, **kwargs: Any) -> SessionRouter:
+        """Enable sticky, prefix-cache-aware routing across ``backends``."""
+        self.router = SessionRouter(backends, **kwargs)
+        self._asgi = None
+        return self.router
 
     def include_skill(self, skill: Skill) -> Skill:
         self.skills.add(skill)
@@ -170,7 +280,7 @@ class AgentAPI:
         return tools
 
     async def call_op(self, name: str, arguments: dict[str, Any],
-                      call_id: Optional[str] = None) -> Any:
+                      call_id: str | None = None) -> Any:
         """Dispatch a model-issued tool call by name (agent loop helper)."""
         op = self.mcp.ops.get(name)
         if op is None:
@@ -178,8 +288,8 @@ class AgentAPI:
         return await op.call(arguments, hooks=self.hooks, call_id=call_id)
 
     async def agent(self, *, model: str, messages: list[dict[str, Any]],
-                    system: Optional[str] = None,
-                    tools: Optional[list[str]] = None,
+                    system: str | None = None,
+                    tools: list[str] | None = None,
                     max_turns: int = 10, **params: Any) -> dict[str, Any]:
         """Run an LLM tool loop against this app's ops inside the current
         run. See agentapi.agent.agent_loop."""
@@ -190,21 +300,50 @@ class AgentAPI:
 
     # -- run creation (shared by all transports) -----------------------------
     def _start_run(self, route: _RunRoute, kwargs: dict[str, Any], *,
-                   tenant: Optional[str], idempotency_key: Optional[str]):
+                   principal: Principal, idempotency_key: str | None):
         if idempotency_key:
+            # Scope the key to the caller: two tenants using the same key
+            # must not collide, and one must never receive the other's run.
+            idempotency_key = f"{principal.tenant or principal.id}:{idempotency_key}"
             existing = self.runs.by_idempotency_key(idempotency_key)
             if existing is not None:
                 return existing, False
         context = RunContext(
-            "pending", tenant=tenant,
+            "pending", tenant=principal.tenant,
             deadline_s=route.deadline,
-            max_usd=route.budget_usd, max_tokens=route.budget_tokens)
+            max_usd=route.budget_usd, max_tokens=route.budget_tokens,
+            metadata={"principal": principal.id})
         context._llm = self.llm
         run = self.runs.start(route.path, route.handler, kwargs,
                               ctx=context, idempotency_key=idempotency_key,
                               hooks=self.hooks,
-                              durable=route.durability == "durable")
+                              durable=route.durability == "durable",
+                              determinism=self.determinism,
+                              owner=(principal.id, principal.tenant))
         return run, True
+
+    # -- housekeeping --------------------------------------------------------
+    async def _gc_loop(self, interval_s: float = 60.0) -> None:
+        """Drop finished runs past the retention window. Without this the
+        in-memory run table is a slow leak on a long-lived server."""
+        while True:
+            await asyncio.sleep(interval_s)
+            try:
+                self.runs.gc()
+                if self.router is not None:
+                    self.router.gc()
+            except Exception:  # noqa: BLE001 - housekeeping never kills serving
+                logging.getLogger("agentapi").exception("run gc failed")
+
+    @contextlib.asynccontextmanager
+    async def _lifespan(self, _app: Any):
+        gc_task = asyncio.create_task(self._gc_loop())
+        try:
+            yield
+        finally:
+            gc_task.cancel()
+            if self.backend is not None:
+                self.backend.flush()
 
     # -- recovery (tier-2 durability) ---------------------------------------
     def recover(self) -> list[str]:
@@ -216,7 +355,9 @@ class AgentAPI:
         if self.backend is None:
             return []
         recovered: list[str] = []
-        for row in self.backend.unfinished_runs():
+        claim = getattr(self.backend, "claim_runs", None)
+        rows = claim() if claim is not None else self.backend.unfinished_runs()
+        for row in rows:
             route = self._run_routes.get(row["route"])
             if route is None or row["id"] in self.runs.runs:
                 continue
@@ -233,7 +374,8 @@ class AgentAPI:
                              for e in self.backend.events(row["id"])]
             self.runs.start(route.path, route.handler, row["kwargs"],
                             ctx=context, hooks=self.hooks, durable=True,
-                            run_id=row["id"], replay_events=replay_events)
+                            run_id=row["id"], replay_events=replay_events,
+                            determinism=self.determinism)
             recovered.append(row["id"])
         return recovered
 
@@ -262,6 +404,10 @@ class AgentAPI:
                                     self._make_op_endpoint(op),
                                     methods=[method or "POST"]))
 
+        routes.append(WebSocketRoute("/ws/runs/{run_id}", self._ws_run))
+        if self._openai_route is not None:
+            routes.append(Route("/v1/chat/completions",
+                                self._post_openai, methods=["POST"]))
         routes += [
             Route("/runs/{run_id}", self._get_run, methods=["GET"]),
             Route("/runs/{run_id}/events", self._get_events, methods=["GET"]),
@@ -273,13 +419,19 @@ class AgentAPI:
             Route("/mcp", self._post_mcp, methods=["POST"]),
             Route("/skills", self._get_skills, methods=["GET"]),
             Route("/pools", self._get_pools, methods=["GET"]),
+            Route("/sessions", self._get_sessions, methods=["GET"]),
             Route("/healthz", lambda r: JSONResponse({"ok": True}),
                   methods=["GET"]),
         ]
-        return Starlette(routes=routes)
+        routes += [Mount(path, app=app) for path, app in self._mounts]
+        return Starlette(routes=routes, lifespan=self._lifespan)
 
     def _make_run_endpoint(self, route: _RunRoute) -> Callable[..., Any]:
         async def endpoint(request: Request) -> Response:
+            try:
+                principal = await self._principal(request)
+            except AuthError as exc:
+                return _auth_response(exc)
             try:
                 body = await request.json() if await request.body() else {}
             except json.JSONDecodeError:
@@ -288,6 +440,15 @@ class AgentAPI:
                 parsed = route.args_model.model_validate(body)
             except Exception as exc:  # noqa: BLE001 - validation error
                 return JSONResponse({"error": str(exc)}, status_code=422)
+
+            limiter = route.rate_limit or self.rate_limit
+            if limiter is not None:
+                try:
+                    limiter.check(limiter.key_for(principal))
+                except RateLimited as exc:
+                    return JSONResponse(
+                        {"error": str(exc)}, status_code=429,
+                        headers={"Retry-After": str(max(1, int(exc.retry_after) + 1))})
             kwargs = {k: getattr(parsed, k) for k in type(parsed).model_fields}
 
             # Deadline-aware admission before any work happens.
@@ -300,8 +461,7 @@ class AgentAPI:
                         headers={"Retry-After": str(int(estimated) + 1)})
 
             run, created = self._start_run(
-                route, kwargs,
-                tenant=request.headers.get("x-tenant-id"),
+                route, kwargs, principal=principal,
                 idempotency_key=request.headers.get("idempotency-key"))
 
             if request.query_params.get("stream") == "false":
@@ -317,6 +477,10 @@ class AgentAPI:
 
     def _make_op_endpoint(self, op: Any) -> Callable[..., Any]:
         async def endpoint(request: Request) -> Response:
+            try:
+                await self._principal(request)
+            except AuthError as exc:
+                return _auth_response(exc)
             try:
                 body = await request.json() if await request.body() else {}
             except json.JSONDecodeError:
@@ -347,19 +511,185 @@ class AgentAPI:
                 if not run.log.closed and run.attached == 0:
                     if on_disconnect == "cancel":
                         self.runs.cancel(run.id)
+                    elif on_disconnect == "drain":
+                        # Stop cleanly at the next step boundary: work
+                        # already in flight finishes and is journaled.
+                        self.runs.drain(run.id)
                     # "detach": run continues; client resumes via
                     # GET /runs/{id}/events?from=<Last-Event-ID + 1>.
-                    # "drain" is honoured by handlers via ctx.draining (future).
 
         return StreamingResponse(
             body(), status_code=status_code, media_type="text/event-stream",
             headers={"x-run-id": run.id, "cache-control": "no-cache",
                      "x-accel-buffering": "no"})
 
+    # -- transport: websocket ------------------------------------------------
+    async def _ws_run(self, websocket: WebSocket) -> None:
+        """Bidirectional attach: events stream out, signals come back in —
+        the natural transport for human-in-the-loop, where SSE would need a
+        second connection to answer."""
+        run_id = websocket.path_params["run_id"]
+        try:
+            principal = await self._principal(websocket)
+        except AuthError:
+            await websocket.close(code=4401)
+            return
+        run = self.runs.get(run_id)
+        if run is None or not owns(principal, run):
+            await websocket.close(code=4404)
+            return
+        await websocket.accept()
+        from_seq = int(websocket.query_params.get("from", 0))
+
+        async def pump() -> None:
+            async for event in run.events(from_seq):
+                await websocket.send_json(event.model_dump(by_alias=True))
+
+        pumping = asyncio.create_task(pump())
+        try:
+            while not pumping.done():
+                receive = asyncio.create_task(websocket.receive_json())
+                done, _ = await asyncio.wait(
+                    {receive, pumping}, return_when=asyncio.FIRST_COMPLETED)
+                if receive in done:
+                    try:
+                        message = receive.result()
+                    except (WebSocketDisconnect, RuntimeError, ValueError):
+                        break
+                    action = message.get("action")
+                    if action == "signal":
+                        self.runs.signal(run_id, message["signal"],
+                                         message.get("payload"))
+                    elif action == "cancel":
+                        self.runs.cancel(run_id)
+                    elif action == "drain":
+                        self.runs.drain(run_id)
+                else:
+                    receive.cancel()
+        except WebSocketDisconnect:
+            pass
+        finally:
+            pumping.cancel()
+            route = self._run_routes.get(run.route)
+            if (route and not run.log.closed and run.attached == 0):
+                if route.on_disconnect == "cancel":
+                    self.runs.cancel(run.id)
+                elif route.on_disconnect == "drain":
+                    self.runs.drain(run.id)
+            try:
+                await websocket.close()
+            except RuntimeError:
+                pass
+
+    # -- transport: OpenAI-compatible chat completions ------------------------
+    async def _post_openai(self, request: Request) -> Response:
+        route = self._run_routes[self._openai_route]
+        try:
+            principal = await self._principal(request)
+        except AuthError as exc:
+            return JSONResponse(
+                {"error": {"message": str(exc), "type": "invalid_request_error"}},
+                status_code=exc.status_code)
+        try:
+            body = await request.json()
+        except json.JSONDecodeError:
+            return JSONResponse({"error": {"message": "invalid JSON"}},
+                                status_code=400)
+        messages = body.get("messages") or []
+        wants_stream = bool(body.get("stream"))
+        kwargs: dict[str, Any] = {}
+        fields = route.args_model.model_fields
+        if "messages" in fields:
+            kwargs["messages"] = messages
+        elif "prompt" in fields:
+            kwargs["prompt"] = messages[-1].get("content", "") if messages else ""
+        for name in ("model", "temperature", "max_tokens"):
+            if name in fields and name in body:
+                kwargs[name] = body[name]
+
+        run, _ = self._start_run(route, kwargs, principal=principal,
+                                 idempotency_key=request.headers.get(
+                                     "idempotency-key"))
+        model_name = body.get("model", "agentapi")
+        created = int(run.created_at)
+
+        if wants_stream:
+            async def chunks():
+                async for event in run.events(0):
+                    delta = None
+                    if event.type == "token":
+                        delta = {"content": event.text}
+                    elif event.type == "message":
+                        delta = {"content": str(event.content)}
+                    elif event.type in ("done", "error"):
+                        payload = {
+                            "id": run.id, "object": "chat.completion.chunk",
+                            "created": created, "model": model_name,
+                            "choices": [{"index": 0, "delta": {},
+                                         "finish_reason": (
+                                             "stop" if event.type == "done"
+                                             else "error")}]}
+                        yield f"data: {json.dumps(payload)}\n\n"
+                        yield "data: [DONE]\n\n"
+                        return
+                    if delta is None:
+                        continue
+                    payload = {"id": run.id, "object": "chat.completion.chunk",
+                               "created": created, "model": model_name,
+                               "choices": [{"index": 0, "delta": delta,
+                                            "finish_reason": None}]}
+                    yield f"data: {json.dumps(payload)}\n\n"
+
+            return StreamingResponse(chunks(), media_type="text/event-stream",
+                                     headers={"x-run-id": run.id,
+                                              "cache-control": "no-cache"})
+
+        if run.task is not None:
+            await asyncio.shield(run.task)
+        text = "".join(e.text for e in run.log.read(0) if e.type == "token")
+        if not text:
+            text = "".join(str(e.content) for e in run.log.read(0)
+                           if e.type == "message")
+        usage = run.ctx.usage
+        return JSONResponse({
+            "id": run.id, "object": "chat.completion", "created": created,
+            "model": model_name,
+            "choices": [{"index": 0, "finish_reason": "stop",
+                         "message": {"role": "assistant", "content": text}}],
+            "usage": {"prompt_tokens": usage.input_tokens,
+                      "completion_tokens": usage.output_tokens,
+                      "total_tokens": usage.input_tokens + usage.output_tokens},
+        }, headers={"x-run-id": run.id})
+
+    def _fanout_sse(self, run_id: str, from_seq: int) -> StreamingResponse:
+        from .fanout import attach
+
+        async def body():
+            async for event in attach(self.fanout, self.backend, run_id,
+                                      from_seq):
+                payload = event.model_dump(by_alias=True)
+                yield (f"id: {event.seq}\n"
+                       f"event: {event.type}\n"
+                       f"data: {json.dumps(payload, default=str)}\n\n")
+
+        return StreamingResponse(
+            body(), media_type="text/event-stream",
+            headers={"x-run-id": run_id, "x-served-by": "fanout",
+                     "cache-control": "no-cache"})
+
     # -- endpoints -----------------------------------------------------------
     async def _get_run(self, request: Request) -> Response:
+        try:
+            principal = await self._principal(request)
+        except AuthError as exc:
+            return _auth_response(exc)
         run_id = request.path_params["run_id"]
         run = self.runs.get(run_id)
+        if run is not None:
+            try:
+                self._authorize_run(principal, run)
+            except AuthError as exc:
+                return _auth_response(exc)
         if run is None:
             if self.backend is not None:
                 row = self.backend.get_run(run_id)
@@ -370,7 +700,24 @@ class AgentAPI:
         return JSONResponse(run.describe())
 
     async def _get_events(self, request: Request) -> Response:
-        run = self.runs.get(request.path_params["run_id"])
+        try:
+            principal = await self._principal(request)
+        except AuthError as exc:
+            return _auth_response(exc)
+        run_id = request.path_params["run_id"]
+        run = self.runs.get(run_id)
+        if run is not None:
+            try:
+                self._authorize_run(principal, run)
+            except AuthError as exc:
+                return _auth_response(exc)
+        if run is None and self.fanout is not None and self.backend is not None:
+            # Another worker owns this run; serve the same resumable stream
+            # by replaying the journal then following the fanout.
+            stored = self.backend.get_run(run_id)
+            if stored is not None:
+                from_seq = int(request.query_params.get("from", 0))
+                return self._fanout_sse(run_id, from_seq)
         if run is None:
             if self.backend is not None:
                 stored = self.backend.events(request.path_params["run_id"])
@@ -392,7 +739,17 @@ class AgentAPI:
         return self._sse(run, from_seq=from_seq, on_disconnect=policy)
 
     async def _post_signal(self, request: Request) -> Response:
+        try:
+            principal = await self._principal(request)
+        except AuthError as exc:
+            return _auth_response(exc)
         run_id = request.path_params["run_id"]
+        run = self.runs.get(run_id)
+        if run is not None:
+            try:
+                self._authorize_run(principal, run)
+            except AuthError as exc:
+                return _auth_response(exc)
         signal = request.path_params["signal"]
         try:
             payload = await request.json() if await request.body() else None
@@ -403,6 +760,16 @@ class AgentAPI:
         return JSONResponse({"ok": True, "run_id": run_id, "signal": signal})
 
     async def _post_cancel(self, request: Request) -> Response:
+        try:
+            principal = await self._principal(request)
+        except AuthError as exc:
+            return _auth_response(exc)
+        run = self.runs.get(request.path_params["run_id"])
+        if run is not None:
+            try:
+                self._authorize_run(principal, run)
+            except AuthError as exc:
+                return _auth_response(exc)
         ok = self.runs.cancel(request.path_params["run_id"])
         if not ok:
             return JSONResponse({"error": "run not found or not cancellable"},
@@ -426,6 +793,10 @@ class AgentAPI:
 
     async def _post_mcp(self, request: Request) -> Response:
         try:
+            await self._principal(request)
+        except AuthError as exc:
+            return _auth_response(exc)
+        try:
             message = await request.json()
         except json.JSONDecodeError:
             return JSONResponse({"jsonrpc": "2.0", "id": None,
@@ -444,6 +815,12 @@ class AgentAPI:
     async def _get_skills(self, request: Request) -> Response:
         return JSONResponse({"skills": [s.describe()
                                         for s in self.skills.all()]})
+
+    async def _get_sessions(self, request: Request) -> Response:
+        if self.router is None:
+            return JSONResponse({"error": "session routing is not enabled"},
+                                status_code=404)
+        return JSONResponse(self.router.stats())
 
     async def _get_pools(self, request: Request) -> Response:
         return JSONResponse({"pools": [p.stats() for p in self.pools.values()]})

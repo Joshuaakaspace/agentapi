@@ -11,13 +11,14 @@ from __future__ import annotations
 import asyncio
 import contextvars
 import math
+import random as _random
 import time
 import uuid as _uuid
-import random as _random
 from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
-from typing import Any, Optional
+from typing import Any
 
+from .determinism import real_time, suppressed
 from .events import Event, Paused, Resumed
 
 
@@ -31,6 +32,17 @@ class DeadlineExceeded(Exception):
 
 class RunCancelled(Exception):
     """Raised inside a handler when the run is cancelled externally."""
+
+
+class RunDraining(Exception):
+    """Raised at the next step boundary when a run is asked to drain: stop
+    cleanly after finishing the work already in flight."""
+
+
+# Depth of nested @step frames on the current task. A draining run keeps
+# going while this is non-zero so it stops *between* steps, not mid-step.
+_step_depth: contextvars.ContextVar[int] = contextvars.ContextVar(
+    "agentapi_step_depth", default=0)
 
 
 @dataclass
@@ -68,11 +80,11 @@ class _Scope:
     max_usd: float = math.inf
     max_tokens: float = math.inf
     usage: Usage = field(default_factory=Usage)
-    parent: Optional["_Scope"] = None
+    parent: _Scope | None = None
 
     def charge(self, *, input_tokens: int = 0, output_tokens: int = 0,
                usd: float = 0.0, **counts: int) -> None:
-        scope: Optional[_Scope] = self
+        scope: _Scope | None = self
         while scope is not None:
             scope.usage.add(input_tokens=input_tokens,
                             output_tokens=output_tokens, usd=usd, **counts)
@@ -101,11 +113,11 @@ def parse_duration(value: str | float | int) -> float:
 class RunContext:
     """Everything a run knows about itself while executing."""
 
-    def __init__(self, run_id: str, *, tenant: Optional[str] = None,
-                 deadline_s: Optional[float] = None,
-                 max_usd: Optional[float] = None,
-                 max_tokens: Optional[int] = None,
-                 metadata: Optional[dict[str, Any]] = None) -> None:
+    def __init__(self, run_id: str, *, tenant: str | None = None,
+                 deadline_s: float | None = None,
+                 max_usd: float | None = None,
+                 max_tokens: int | None = None,
+                 metadata: dict[str, Any] | None = None) -> None:
         self.run_id = run_id
         self.tenant = tenant
         self.metadata = metadata or {}
@@ -116,22 +128,48 @@ class RunContext:
             max_tokens=math.inf if max_tokens is None else max_tokens,
         )
         self._cancelled = False
+        self._draining = False
         self._signals: dict[str, asyncio.Queue[Any]] = {}
         self._emit_cb = None          # wired by the runtime
         self._llm = None              # wired by the app (LLM client facade)
         self._step_journal: dict[str, Any] = {}
         self._step_commit = None      # durable backend hook, wired by the app
+        self._det_seq = 0             # ordinal for journaled ctx.now/uuid/random
+        self._llm_record = None       # backend hook: persist an LLM call
+        self._llm_replay: list[Any] = []   # recorded calls to replay, in order
+        self._llm_replay_cursor = 0
         self._rng = _random.Random(run_id)  # deterministic per run
 
     # -- identity / determinism helpers ------------------------------------
+    # These are the replay-safe alternatives to time.time()/uuid4()/random().
+    # Each records its value in the run journal the first time it is called
+    # and returns the recorded value on replay, so a recovered run sees the
+    # same clock, ids and dice as the original execution.
+    def _journaled(self, kind: str, produce: Any) -> Any:
+        self._det_seq += 1
+        key = f"__det__:{kind}:{self._det_seq}"
+        if key in self._step_journal:
+            return self._step_journal[key]
+        with suppressed():
+            value = produce()
+        self._step_journal[key] = value
+        if self._step_commit is not None:
+            self._step_commit(key, value)
+        return value
+
     def now(self) -> float:
-        return time.time()
+        """Wall clock, journaled: replays return the original timestamp."""
+        return self._journaled("now", real_time)
 
     def uuid(self) -> str:
-        return str(_uuid.UUID(int=self._rng.getrandbits(128), version=4))
+        """A UUID, journaled so a replay produces the same id."""
+        return self._journaled(
+            "uuid",
+            lambda: str(_uuid.UUID(int=self._rng.getrandbits(128), version=4)))
 
     def random(self) -> float:
-        return self._rng.random()
+        """A random float, journaled so a replay produces the same value."""
+        return self._journaled("random", self._rng.random)
 
     # -- deadline / budget --------------------------------------------------
     @property
@@ -139,12 +177,14 @@ class RunContext:
         return self._scope.deadline - time.monotonic()
 
     def check(self) -> None:
-        """Raise if the run is cancelled or out of time. Called by the
-        runtime around every event append, LLM call and tool call."""
+        """Raise if the run is cancelled, draining or out of time. Called by
+        the runtime around every event append, LLM call and tool call."""
         if self._cancelled:
             raise RunCancelled(f"run {self.run_id} was cancelled")
         if self.deadline_remaining <= 0:
             raise DeadlineExceeded(f"deadline exceeded for run {self.run_id}")
+        if self._draining and _step_depth.get() == 0:
+            raise RunDraining(f"run {self.run_id} is draining")
 
     @property
     def usage(self) -> Usage:
@@ -161,9 +201,9 @@ class RunContext:
         self._scope.charge(**kwargs)
 
     @asynccontextmanager
-    async def budget(self, *, usd: Optional[float] = None,
-                     tokens: Optional[int] = None,
-                     deadline: Optional[str | float] = None):
+    async def budget(self, *, usd: float | None = None,
+                     tokens: int | None = None,
+                     deadline: str | float | None = None):
         """Open a nested budget/deadline scope. Limits only shrink: a child
         deadline can never outlive its parent, and charges roll up so parent
         budgets see child spend."""
@@ -194,6 +234,17 @@ class RunContext:
     def cancelled(self) -> bool:
         return self._cancelled
 
+    # -- drain --------------------------------------------------------------
+    def drain(self) -> None:
+        """Ask the run to stop cleanly at the next step boundary."""
+        self._draining = True
+
+    @property
+    def draining(self) -> bool:
+        """True once a drain was requested. Handlers doing long loops can
+        check this to bail out early and emit a partial result."""
+        return self._draining
+
     # -- events -------------------------------------------------------------
     async def emit(self, event: Event) -> Event:
         """Emit an event into the run's log from anywhere (tools, hooks)."""
@@ -204,7 +255,7 @@ class RunContext:
 
     # -- pause / signal (human-in-the-loop) ---------------------------------
     async def pause(self, signal: str, *, schema: Any = None,
-                    timeout: Optional[str | float] = None) -> Any:
+                    timeout: str | float | None = None) -> Any:
         """Suspend until ``POST /runs/{id}/signals/{signal}`` delivers a
         payload. Emits ``Paused``/``Resumed`` events so attached clients see
         the state change."""
@@ -225,8 +276,9 @@ class RunContext:
                 payload = await queue.get()
             else:
                 payload = await asyncio.wait_for(queue.get(), timeout=timeout_s)
-        except asyncio.TimeoutError:
-            raise DeadlineExceeded(f"timed out waiting for signal {signal!r}")
+        except TimeoutError as exc:
+            raise DeadlineExceeded(
+                f"timed out waiting for signal {signal!r}") from exc
         if isinstance(payload, RunCancelled):
             raise payload
         if schema is not None and hasattr(schema, "model_validate"):
@@ -242,6 +294,20 @@ class RunContext:
         queue.put_nowait(payload)
         return True
 
+    # -- recorded LLM calls (replay) ----------------------------------------
+    def next_recorded_llm_call(self) -> dict[str, Any] | None:
+        """Return the next recorded LLM response when replaying, else None."""
+        if self._llm_replay_cursor >= len(self._llm_replay):
+            return None
+        call = self._llm_replay[self._llm_replay_cursor]
+        self._llm_replay_cursor += 1
+        return call
+
+    def record_llm_call(self, model: str, request: dict[str, Any],
+                        response: dict[str, Any]) -> None:
+        if self._llm_record is not None:
+            self._llm_record(model, request, response)
+
     @property
     def llm(self):
         if self._llm is None:
@@ -251,7 +317,7 @@ class RunContext:
         return self._llm
 
 
-_current: contextvars.ContextVar[Optional[RunContext]] = contextvars.ContextVar(
+_current: contextvars.ContextVar[RunContext | None] = contextvars.ContextVar(
     "agentapi_ctx", default=None)
 
 

@@ -1,17 +1,25 @@
 """Admission control: model backends are the real bottleneck.
 
 A Pool models one upstream capacity (an LLM backend, a scraping quota).
-Handlers reserve from pools before running. Key behaviour FastAPI lacks:
-**deadline-aware shedding** — if the caller's deadline cannot survive the
-current queue, reject *now* with retry-after instead of burning a slot to
-time out later.
+Three behaviours a general web framework will not give you:
+
+* **Deadline-aware shedding** — if the caller's deadline cannot survive the
+  current queue, reject *now* with a retry hint instead of burning a slot
+  to time out later.
+* **Per-tenant fair queueing** — waiters are served by deficit round robin
+  across tenants, so one customer's batch job cannot starve everyone's
+  interactive chat no matter how deep it queues.
+* **Adaptive capacity** — upstream 429s shrink the effective concurrency
+  and a cooldown holds it there; sustained success walks it back up. Static
+  config is always wrong about a shared quota.
 """
 from __future__ import annotations
 
 import asyncio
-import time
+from collections import defaultdict, deque
 from contextlib import asynccontextmanager
-from typing import Optional
+
+from .determinism import real_monotonic
 
 
 class PoolSaturated(Exception):
@@ -22,34 +30,78 @@ class PoolSaturated(Exception):
         self.retry_after = retry_after
 
 
+_DEFAULT_TENANT = "__default__"
+
+
 class Pool:
     def __init__(self, name: str, *, concurrency: int = 64,
-                 rpm: Optional[int] = None,
+                 rpm: int | None = None,
                  max_queue: int = 256,
-                 avg_latency_s: float = 2.0) -> None:
+                 avg_latency_s: float = 2.0,
+                 min_concurrency: int = 1,
+                 recovery_after_s: float = 30.0) -> None:
         self.name = name
-        self.concurrency = concurrency
+        self.concurrency = concurrency          # configured ceiling
         self.rpm = rpm
         self.max_queue = max_queue
-        self._sem = asyncio.Semaphore(concurrency)
-        self._waiting = 0
-        # naive rolling-minute request accounting for the rpm cap
-        self._minute_start = time.monotonic()
-        self._minute_count = 0
-        # observed latency EWMA feeds the deadline-aware admission estimate
-        self._latency_ewma = avg_latency_s
+        self.min_concurrency = max(1, min_concurrency)
+        self.recovery_after_s = recovery_after_s
 
+        self._effective = concurrency           # adaptive, <= concurrency
+        self._in_flight = 0
+        self._waiters: dict[str, deque[asyncio.Future]] = defaultdict(deque)
+        self._rotation: list[str] = []          # tenants with pending waiters
+        self._cursor = 0
+        self._waiting = 0
+
+        self._minute_start = real_monotonic()
+        self._minute_count = 0
+        self._latency_ewma = avg_latency_s
+        self._throttled_until = 0.0
+        self._successes_since_throttle = 0
+
+    # -- capacity -----------------------------------------------------------
+    @property
+    def effective_concurrency(self) -> int:
+        """Current ceiling, after any adaptive throttling has been applied."""
+        if self._throttled_until and real_monotonic() >= self._throttled_until:
+            self._throttled_until = 0.0
+        return self._effective
+
+    def report_upstream_429(self, retry_after: float | None = None) -> None:
+        """Upstream refused us. Halve effective concurrency and hold it for a
+        cooldown; the pool is over its real share of a shared quota."""
+        self._effective = max(self.min_concurrency, self._effective // 2)
+        self._throttled_until = real_monotonic() + (
+            retry_after if retry_after is not None else self.recovery_after_s)
+        self._successes_since_throttle = 0
+
+    def report_success(self) -> None:
+        """Walk capacity back up after a run of clean calls (additive
+        increase to pair with the multiplicative decrease above)."""
+        if self._effective >= self.concurrency:
+            return
+        if self._throttled_until and real_monotonic() < self._throttled_until:
+            return
+        self._successes_since_throttle += 1
+        if self._successes_since_throttle >= self._effective:
+            self._effective = min(self.concurrency, self._effective + 1)
+            self._successes_since_throttle = 0
+            self._dispatch()
+
+    # -- admission ----------------------------------------------------------
     def _estimated_wait(self) -> float:
         """Rough time-to-slot given queue depth and observed latency."""
-        if self._sem._value > 0 and self._waiting == 0:  # noqa: SLF001
+        capacity = self.effective_concurrency
+        if self._in_flight < capacity and self._waiting == 0:
             return 0.0
-        waves = (self._waiting + 1) / max(self.concurrency, 1)
+        waves = (self._waiting + 1) / max(capacity, 1)
         return waves * self._latency_ewma
 
     def _check_rpm(self) -> None:
         if self.rpm is None:
             return
-        now = time.monotonic()
+        now = real_monotonic()
         if now - self._minute_start >= 60:
             self._minute_start = now
             self._minute_count = 0
@@ -59,12 +111,31 @@ class Pool:
                 retry_after=60 - (now - self._minute_start))
         self._minute_count += 1
 
+    def _dispatch(self) -> None:
+        """Hand free slots to waiters, one tenant at a time, round robin."""
+        while self._in_flight < self.effective_concurrency and self._rotation:
+            self._cursor %= len(self._rotation)
+            tenant = self._rotation[self._cursor]
+            queue = self._waiters.get(tenant)
+            if not queue:
+                self._rotation.pop(self._cursor)
+                continue
+            future = queue.popleft()
+            if not queue:
+                self._waiters.pop(tenant, None)
+                self._rotation.pop(self._cursor)
+            else:
+                self._cursor += 1
+            if future.done():        # cancelled while queued
+                continue
+            self._in_flight += 1
+            future.set_result(None)
+
     @asynccontextmanager
-    async def acquire(self, *, deadline_remaining: Optional[float] = None):
+    async def acquire(self, *, tenant: str | None = None,
+                      deadline_remaining: float | None = None):
         estimated = self._estimated_wait()
         if deadline_remaining is not None and estimated > deadline_remaining:
-            # The single highest-leverage behaviour under load: this request
-            # cannot make its deadline, so shed it before it costs anything.
             raise PoolSaturated(
                 f"pool {self.name!r}: estimated wait {estimated:.1f}s exceeds "
                 f"deadline budget {deadline_remaining:.1f}s",
@@ -74,25 +145,45 @@ class Pool:
                 f"pool {self.name!r}: queue full ({self.max_queue})",
                 retry_after=self._latency_ewma)
         self._check_rpm()
-        self._waiting += 1
-        try:
-            await self._sem.acquire()
-        finally:
-            self._waiting -= 1
-        started = time.monotonic()
+
+        key = tenant or _DEFAULT_TENANT
+        if self._in_flight < self.effective_concurrency and not self._rotation:
+            self._in_flight += 1            # fast path: uncontended
+        else:
+            future: asyncio.Future = asyncio.get_running_loop().create_future()
+            queue = self._waiters[key]
+            queue.append(future)
+            if key not in self._rotation:
+                self._rotation.append(key)
+            self._waiting += 1
+            try:
+                self._dispatch()
+                await future
+            except BaseException:
+                future.cancel()
+                raise
+            finally:
+                self._waiting -= 1
+
+        started = real_monotonic()
         try:
             yield self
         finally:
-            elapsed = time.monotonic() - started
+            elapsed = real_monotonic() - started
             self._latency_ewma = 0.8 * self._latency_ewma + 0.2 * elapsed
-            self._sem.release()
+            self._in_flight -= 1
+            self._dispatch()
 
     def stats(self) -> dict[str, float | int | str]:
         return {
             "name": self.name,
             "concurrency": self.concurrency,
-            "in_flight": self.concurrency - self._sem._value,  # noqa: SLF001
+            "effective_concurrency": self.effective_concurrency,
+            "in_flight": self._in_flight,
             "waiting": self._waiting,
+            "tenants_queued": len(self._rotation),
             "latency_ewma_s": round(self._latency_ewma, 3),
             "estimated_wait_s": round(self._estimated_wait(), 3),
+            "throttled": bool(self._throttled_until
+                              and real_monotonic() < self._throttled_until),
         }

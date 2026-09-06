@@ -9,16 +9,18 @@ from __future__ import annotations
 
 import json
 import os
-from typing import Any, AsyncIterator, Optional
+from collections.abc import AsyncIterator
+from typing import Any
 
 from .context import get_ctx
+from .partial import PartialModel, complete_json
 from .pools import Pool
 
 
 class BaseLLM:
     """Provider interface. Implement ``_complete`` and ``_stream``."""
 
-    def __init__(self, *, pool: Optional[Pool] = None,
+    def __init__(self, *, pool: Pool | None = None,
                  usd_per_input_mtok: float = 3.0,
                  usd_per_output_mtok: float = 15.0,
                  hooks: Any = None) -> None:
@@ -32,11 +34,25 @@ class BaseLLM:
                        **params: Any) -> dict[str, Any]:
         ctx = get_ctx()
         ctx.check()
+        # A recorded run replays its LLM responses instead of re-calling the
+        # provider: this is what makes `agentapi replay` free and offline.
+        recorded = ctx.next_recorded_llm_call()
+        if recorded is not None:
+            response = recorded["response"]
+            self._charge(ctx, response.get("usage", {}))
+            return response
         if self.hooks:
             await self.hooks.fire("on_llm_call", model, params)
-        async with self._admission(ctx):
-            response = await self._complete(model=model, messages=messages,
-                                            **params)
+        try:
+            async with self._admission(ctx):
+                response = await self._complete(model=model, messages=messages,
+                                                **params)
+        except Exception as exc:  # noqa: BLE001 - feed 429s back to the pool
+            self._note_upstream_error(exc)
+            raise
+        if self.pool is not None:
+            self.pool.report_success()
+        ctx.record_llm_call(model, {"messages": messages, **params}, response)
         self._charge(ctx, response.get("usage", {}))
         if self.hooks:
             await self.hooks.fire("on_llm_result", model, response.get("usage"))
@@ -64,11 +80,67 @@ class BaseLLM:
         if self.hooks:
             await self.hooks.fire("on_llm_result", model, usage)
 
+    async def stream_as(self, model: type, *, prompt: str,
+                        llm_model: str = "claude-opus-5",
+                        max_repairs: int = 1,
+                        **params: Any):
+        """Stream a typed object, yielding a ``PartialModel`` per delta.
+
+            async for partial in ctx.llm.stream_as(Invoice, prompt=...):
+                ...          # partial.total is None until it has arrived
+            # the last yielded partial has .complete once it validates
+
+        If the stream ends without validating, the model is re-prompted with
+        the validation error (bounded by ``max_repairs`` and the budget).
+        """
+        schema = model.model_json_schema()
+        instruction = (
+            f"{prompt}\n\nRespond with JSON only, matching this schema:\n"
+            f"{json.dumps(schema)}")
+        for attempt in range(max_repairs + 1):
+            buffer = ""
+            last: Any = None
+            async for chunk in self.stream(
+                    model=llm_model,
+                    messages=[{"role": "user", "content": instruction}],
+                    **params):
+                buffer += chunk
+                parsed = complete_json(buffer)
+                if parsed is None:
+                    continue
+                last = PartialModel(model, parsed)
+                yield last
+            if last is not None and last.complete is not None:
+                return
+            if attempt >= max_repairs:
+                raise ValueError(
+                    f"model did not produce a valid {model.__name__} after "
+                    f"{attempt + 1} attempt(s); last fragment: {buffer[:200]!r}")
+            instruction = (
+                f"{prompt}\n\nYour previous reply was not valid "
+                f"{model.__name__} JSON. Reply with JSON only matching:\n"
+                f"{json.dumps(schema)}")
+
     # -- internals ----------------------------------------------------------
+    def _note_upstream_error(self, exc: Exception) -> None:
+        """Shrink pool capacity when the provider says we are over quota."""
+        if self.pool is None:
+            return
+        status = getattr(getattr(exc, "response", None), "status_code", None)
+        if status == 429:
+            retry_after = None
+            headers = getattr(getattr(exc, "response", None), "headers", {})
+            try:
+                retry_after = float(headers.get("retry-after"))
+            except (TypeError, ValueError):
+                pass
+            self.pool.report_upstream_429(retry_after)
+
     def _admission(self, ctx: Any):
         if self.pool is not None:
             remaining = ctx.deadline_remaining
             return self.pool.acquire(
+                tenant=ctx.tenant,
                 deadline_remaining=None if remaining == float("inf") else remaining)
         from contextlib import asynccontextmanager
 
@@ -98,7 +170,7 @@ class BaseLLM:
 class AnthropicLLM(BaseLLM):
     """Claude API provider over httpx (streaming via SSE)."""
 
-    def __init__(self, api_key: Optional[str] = None,
+    def __init__(self, api_key: str | None = None,
                  base_url: str = "https://api.anthropic.com", **kwargs: Any) -> None:
         super().__init__(**kwargs)
         self.api_key = api_key or os.environ.get("ANTHROPIC_API_KEY", "")
@@ -128,10 +200,11 @@ class AnthropicLLM(BaseLLM):
         import httpx
         payload = {"model": model, "messages": messages,
                    "max_tokens": max_tokens, "stream": True, **params}
-        async with httpx.AsyncClient(timeout=600) as client:
-            async with client.stream("POST", f"{self.base_url}/v1/messages",
-                                     headers=self._headers(),
-                                     json=payload) as response:
+        async with (
+            httpx.AsyncClient(timeout=600) as client,
+            client.stream("POST", f"{self.base_url}/v1/messages",
+                          headers=self._headers(), json=payload) as response,
+        ):
                 response.raise_for_status()
                 async for line in response.aiter_lines():
                     if not line.startswith("data:"):
@@ -156,7 +229,7 @@ class MockLLM(BaseLLM):
     tool-use turn: ``{"tool_use": [{"name": "search", "input": {...}}],
     "text": "optional preamble"}``."""
 
-    def __init__(self, script: Optional[list[str]] = None, **kwargs: Any) -> None:
+    def __init__(self, script: list[str] | None = None, **kwargs: Any) -> None:
         super().__init__(**kwargs)
         self.script = script or []
         self._cursor = 0

@@ -102,6 +102,13 @@ async def fetch_docs(q: str) -> list[Doc]: ...
   `time`/`random`/`uuid`/socket in handler scope and raise loudly outside steps.
   Silent journal corruption is the failure mode that kills adoption of this
   pattern, and it is preventable.
+  *(Built — see `agentapi/determinism.py`. Two halves: proactive wrappers on
+  `time`/`random`/`uuid` that fire only on tasks running durable handler code,
+  and reactive replay-divergence detection that catches everything the
+  wrappers cannot see. `ctx.now()/uuid()/random()` are journaled so a replay
+  sees the same clock, ids and dice. Known blind spot: `datetime.datetime.now`
+  cannot be wrapped — it is a C type — so it is caught reactively, not at the
+  call site.)*
 - Journal writes are batched/group-committed so a 20-step agent isn't 20 fsyncs.
 
 ### 3.4 `ctx` — deadline, budget, cancellation, tenancy

@@ -8,10 +8,12 @@ makes streams resumable and runs watchable by more than one client.
 from __future__ import annotations
 
 import asyncio
-import time
-from typing import Any, AsyncIterator, Optional
+from collections.abc import AsyncIterator
+from typing import Any
 
 from pydantic import BaseModel, Field
+
+from .determinism import real_time
 
 
 class Event(BaseModel):
@@ -47,15 +49,15 @@ class ToolCall(Event):
     type: str = "tool_call"
     name: str
     arguments: dict[str, Any] = Field(default_factory=dict)
-    call_id: Optional[str] = None
+    call_id: str | None = None
 
 
 class ToolResult(Event):
     type: str = "tool_result"
     name: str
     result: Any = None
-    call_id: Optional[str] = None
-    error: Optional[str] = None
+    call_id: str | None = None
+    error: str | None = None
 
 
 class StateDelta(Event):
@@ -68,7 +70,7 @@ class Paused(Event):
     """Run is waiting on an external signal (human-in-the-loop)."""
     type: str = "paused"
     signal: str
-    schema_: Optional[dict[str, Any]] = Field(default=None, alias="schema")
+    schema_: dict[str, Any] | None = Field(default=None, alias="schema")
 
     model_config = {"populate_by_name": True}
 
@@ -148,7 +150,7 @@ class EventLog:
         if len(self._events) >= self._max:
             raise RuntimeError(f"event log overflow (> {self._max} events)")
         event.seq = len(self._events)
-        event.ts = time.time()
+        event.ts = real_time()
         self._events.append(event)
         if event.type in TERMINAL_TYPES:
             self._closed = True
@@ -156,7 +158,7 @@ class EventLog:
             self._changed.notify_all()
         return event
 
-    def read(self, from_seq: int = 0, limit: Optional[int] = None) -> list[Event]:
+    def read(self, from_seq: int = 0, limit: int | None = None) -> list[Event]:
         """Read already-appended events starting at ``from_seq``."""
         end = None if limit is None else from_seq + limit
         return self._events[from_seq:end]
