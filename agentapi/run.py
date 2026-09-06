@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import asyncio
 import inspect
+import logging
 import time
 import uuid
 from collections.abc import AsyncIterator, Callable
@@ -24,6 +25,7 @@ from .context import (
 )
 from .determinism import NondeterminismError, guarding, real_time
 from .events import Done, Event, EventLog, Paused, Resumed, RunError
+from .journal_async import AsyncJournal
 
 
 def _event_fingerprint(event: Event) -> str:
@@ -92,6 +94,9 @@ class RunManager:
         self._idempotency: dict[str, str] = {}   # Idempotency-Key -> run_id
         self.retention_s = retention_s
         self.backend = backend                   # durable journal (tier 2)
+        # Every backend call goes through a thread so a durable run's writes
+        # never stall the event loop other runs are sharing.
+        self.journal = AsyncJournal(backend) if backend is not None else None
         from .redaction import NullRedactor
         self.redactor = redactor or NullRedactor()
         self.fanout = fanout                     # cross-worker mirror
@@ -127,6 +132,7 @@ class RunManager:
             self._idempotency[idempotency_key] = run_id
 
         backend = self.backend if durable else None
+        journal = self.journal if durable else None
         if backend is not None:
             if recovering:
                 log.restore(replay_events or [])
@@ -134,16 +140,19 @@ class RunManager:
                 backend.create_run(run_id, route, kwargs,
                                    tenant=context.tenant,
                                    metadata=context.metadata)
-            context._step_commit = (
-                lambda key, result:
-                backend.save_step(run_id, key, self.redactor.step(result)))
             redactor = self.redactor
+            pending = context._pending_writes
+
+            context._step_commit = (
+                lambda key, result: journal.call_soon(
+                    pending, "save_step", run_id, key, redactor.step(result)))
+            context._flush = lambda: journal.drain(pending)
 
             def _record_llm(model, request, response):
                 clean_request, clean_response = redactor.llm_call(
                     request, response)
-                backend.record_llm_call(run_id, model, clean_request,
-                                        clean_response)
+                journal.call_soon(pending, "record_llm_call", run_id, model,
+                                  clean_request, clean_response)
 
             context._llm_record = _record_llm
 
@@ -169,17 +178,18 @@ class RunManager:
                 self._diverged(run, event, replay[replay_cursor[0]][1])
             appended = await log.append(event)
             self._track_pause(run, appended)
-            if backend is not None:
+            if journal is not None:
                 # Redact on the way in: what never reaches the journal
                 # cannot leak from it. Attached clients still see the real
                 # event — they are the caller who supplied the content.
-                backend.append_event(
-                    run_id, appended.seq,
+                await journal.drain(pending)
+                await journal.call(
+                    "append_event", run_id, appended.seq,
                     self.redactor.event(appended.model_dump(by_alias=True)))
                 if isinstance(appended, Paused):
-                    backend.update_status(run_id, "paused")
+                    await journal.call("update_status", run_id, "paused")
                 elif isinstance(appended, Resumed):
-                    backend.update_status(run_id, "running")
+                    await journal.call("update_status", run_id, "running")
             if self.fanout is not None:
                 await self.fanout.publish(run_id, appended)
             if hooks is not None:
@@ -287,10 +297,15 @@ class RunManager:
             except Exception:  # noqa: BLE001 - never mask the real outcome
                 pass
             run.finished_at = real_time()
-            if getattr(run, "durable", False) and self.backend is not None:
-                self.backend.update_status(run.id, run.status.value,
-                                           finished=True)
-                self.backend.flush()   # a finished run is always durable
+            if getattr(run, "durable", False) and self.journal is not None:
+                try:
+                    await self.journal.drain(run.ctx._pending_writes)
+                    await self.journal.call("update_status", run.id,
+                                            run.status.value, finished=True)
+                    await self.journal.call("flush")
+                except Exception:  # noqa: BLE001 - never mask the outcome
+                    logging.getLogger("agentapi").exception(
+                        "failed to persist terminal state for %s", run.id)
             _current.reset(token)
             if hooks is not None:
                 await hooks.fire("on_run_end", run)
@@ -329,8 +344,11 @@ class RunManager:
         run = self.runs.get(run_id)
         if run is None:
             return False
-        if getattr(run, "durable", False) and self.backend is not None:
-            self.backend.append_signal(run_id, signal, payload)
+        if getattr(run, "durable", False) and self.journal is not None:
+            # Fire-and-forget: the in-memory delivery below is what unblocks
+            # the run; persistence only matters for a later replay.
+            asyncio.create_task(
+                self.journal.call("append_signal", run_id, signal, payload))
         return run.ctx.deliver_signal(signal, payload)
 
     def gc(self) -> int:

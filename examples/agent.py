@@ -52,6 +52,11 @@ harness = attach_harness(
 app.recover()   # resume anything a previous process left unfinished
 
 
+@app.hook("on_run_start")
+async def _noop(run):
+    """Placeholder so the hook surface is visible in the example."""
+
+
 @app.hook("on_run_end")
 async def audit(run):
     usage = run.ctx.usage
