@@ -7,8 +7,17 @@ import httpx
 import pytest
 from pydantic import BaseModel
 
-from agentapi import (AgentAPI, Done, MockLLM, Principal, StateDelta, Token,
-                      bearer_tokens, ctx, step)
+from agentapi import (
+    AgentAPI,
+    Done,
+    MockLLM,
+    Principal,
+    StateDelta,
+    Token,
+    bearer_tokens,
+    ctx,
+    step,
+)
 
 pytestmark = pytest.mark.asyncio
 
@@ -373,11 +382,12 @@ async def test_sessions_endpoint_reports_hit_rate():
 # --- OpenTelemetry tracing -------------------------------------------------
 
 async def test_tracing_emits_spans_correlated_by_run():
-    from opentelemetry import trace
     from opentelemetry.sdk.trace import TracerProvider
     from opentelemetry.sdk.trace.export import SimpleSpanProcessor
     from opentelemetry.sdk.trace.export.in_memory_span_exporter import (
-        InMemorySpanExporter)
+        InMemorySpanExporter,
+    )
+
     from agentapi import instrument
 
     exporter = InMemorySpanExporter()
@@ -426,8 +436,10 @@ async def test_tracing_marks_failed_runs_as_error():
     from opentelemetry.sdk.trace import TracerProvider
     from opentelemetry.sdk.trace.export import SimpleSpanProcessor
     from opentelemetry.sdk.trace.export.in_memory_span_exporter import (
-        InMemorySpanExporter)
+        InMemorySpanExporter,
+    )
     from opentelemetry.trace import StatusCode
+
     from agentapi import instrument
 
     exporter = InMemorySpanExporter()
@@ -456,7 +468,9 @@ async def test_tracing_does_not_capture_content_by_default():
     from opentelemetry.sdk.trace import TracerProvider
     from opentelemetry.sdk.trace.export import SimpleSpanProcessor
     from opentelemetry.sdk.trace.export.in_memory_span_exporter import (
-        InMemorySpanExporter)
+        InMemorySpanExporter,
+    )
+
     from agentapi import instrument
 
     exporter = InMemorySpanExporter()

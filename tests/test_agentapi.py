@@ -7,8 +7,17 @@ import httpx
 import pytest
 from pydantic import BaseModel
 
-from agentapi import (AgentAPI, BudgetExceeded, Done, MockLLM, Skill,
-                      StateDelta, Token, ctx, step)
+from agentapi import (
+    AgentAPI,
+    BudgetExceeded,
+    Done,
+    MockLLM,
+    Skill,
+    StateDelta,
+    Token,
+    ctx,
+    step,
+)
 
 pytestmark = pytest.mark.asyncio
 
@@ -524,7 +533,6 @@ async def test_pool_limits_concurrency():
 
 async def test_pool_deadline_aware_shedding():
     from agentapi import PoolSaturated
-    pool = Pool = None
     from agentapi.pools import Pool
     pool = Pool("tiny", concurrency=1, avg_latency_s=10.0)
 

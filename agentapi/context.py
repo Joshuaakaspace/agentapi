@@ -11,14 +11,14 @@ from __future__ import annotations
 import asyncio
 import contextvars
 import math
+import random as _random
 import time
 import uuid as _uuid
-import random as _random
 from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
-from typing import Any, Optional
+from typing import Any
 
-from .determinism import NondeterminismError, real_time, suppressed
+from .determinism import real_time, suppressed
 from .events import Event, Paused, Resumed
 
 
@@ -80,11 +80,11 @@ class _Scope:
     max_usd: float = math.inf
     max_tokens: float = math.inf
     usage: Usage = field(default_factory=Usage)
-    parent: Optional["_Scope"] = None
+    parent: _Scope | None = None
 
     def charge(self, *, input_tokens: int = 0, output_tokens: int = 0,
                usd: float = 0.0, **counts: int) -> None:
-        scope: Optional[_Scope] = self
+        scope: _Scope | None = self
         while scope is not None:
             scope.usage.add(input_tokens=input_tokens,
                             output_tokens=output_tokens, usd=usd, **counts)
@@ -113,11 +113,11 @@ def parse_duration(value: str | float | int) -> float:
 class RunContext:
     """Everything a run knows about itself while executing."""
 
-    def __init__(self, run_id: str, *, tenant: Optional[str] = None,
-                 deadline_s: Optional[float] = None,
-                 max_usd: Optional[float] = None,
-                 max_tokens: Optional[int] = None,
-                 metadata: Optional[dict[str, Any]] = None) -> None:
+    def __init__(self, run_id: str, *, tenant: str | None = None,
+                 deadline_s: float | None = None,
+                 max_usd: float | None = None,
+                 max_tokens: int | None = None,
+                 metadata: dict[str, Any] | None = None) -> None:
         self.run_id = run_id
         self.tenant = tenant
         self.metadata = metadata or {}
@@ -201,9 +201,9 @@ class RunContext:
         self._scope.charge(**kwargs)
 
     @asynccontextmanager
-    async def budget(self, *, usd: Optional[float] = None,
-                     tokens: Optional[int] = None,
-                     deadline: Optional[str | float] = None):
+    async def budget(self, *, usd: float | None = None,
+                     tokens: int | None = None,
+                     deadline: str | float | None = None):
         """Open a nested budget/deadline scope. Limits only shrink: a child
         deadline can never outlive its parent, and charges roll up so parent
         budgets see child spend."""
@@ -255,7 +255,7 @@ class RunContext:
 
     # -- pause / signal (human-in-the-loop) ---------------------------------
     async def pause(self, signal: str, *, schema: Any = None,
-                    timeout: Optional[str | float] = None) -> Any:
+                    timeout: str | float | None = None) -> Any:
         """Suspend until ``POST /runs/{id}/signals/{signal}`` delivers a
         payload. Emits ``Paused``/``Resumed`` events so attached clients see
         the state change."""
@@ -276,8 +276,9 @@ class RunContext:
                 payload = await queue.get()
             else:
                 payload = await asyncio.wait_for(queue.get(), timeout=timeout_s)
-        except asyncio.TimeoutError:
-            raise DeadlineExceeded(f"timed out waiting for signal {signal!r}")
+        except TimeoutError as exc:
+            raise DeadlineExceeded(
+                f"timed out waiting for signal {signal!r}") from exc
         if isinstance(payload, RunCancelled):
             raise payload
         if schema is not None and hasattr(schema, "model_validate"):
@@ -294,7 +295,7 @@ class RunContext:
         return True
 
     # -- recorded LLM calls (replay) ----------------------------------------
-    def next_recorded_llm_call(self) -> Optional[dict[str, Any]]:
+    def next_recorded_llm_call(self) -> dict[str, Any] | None:
         """Return the next recorded LLM response when replaying, else None."""
         if self._llm_replay_cursor >= len(self._llm_replay):
             return None
@@ -316,7 +317,7 @@ class RunContext:
         return self._llm
 
 
-_current: contextvars.ContextVar[Optional[RunContext]] = contextvars.ContextVar(
+_current: contextvars.ContextVar[RunContext | None] = contextvars.ContextVar(
     "agentapi_ctx", default=None)
 
 

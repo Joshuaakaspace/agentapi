@@ -12,8 +12,9 @@ function that actually runs".
 from __future__ import annotations
 
 import inspect
+from collections.abc import Callable
 from dataclasses import dataclass, field
-from typing import Any, Callable, Optional, get_type_hints
+from typing import Any, get_type_hints
 
 from pydantic import BaseModel, create_model
 
@@ -45,12 +46,12 @@ class Op:
     description: str = ""
     args_model: type[BaseModel] = None            # type: ignore[assignment]
     args_schema: dict[str, Any] = field(default_factory=dict)
-    http: Optional[str] = None                    # e.g. "POST /tools/search"
+    http: str | None = None                    # e.g. "POST /tools/search"
     llm_tool: bool = True
     mcp: bool = True
 
     async def call(self, arguments: dict[str, Any], *, hooks: Any = None,
-                   call_id: Optional[str] = None) -> Any:
+                   call_id: str | None = None) -> Any:
         """Validated invocation used by every surface. Emits ToolCall /
         ToolResult events when running inside a run context."""
         parsed = self.args_model.model_validate(arguments or {})
@@ -108,8 +109,8 @@ class OpRegistry:
     def __init__(self) -> None:
         self._ops: dict[str, Op] = {}
 
-    def register(self, fn: Callable[..., Any], *, name: Optional[str] = None,
-                 description: Optional[str] = None, http: Optional[str] = None,
+    def register(self, fn: Callable[..., Any], *, name: str | None = None,
+                 description: str | None = None, http: str | None = None,
                  llm_tool: bool = True, mcp: bool = True) -> Op:
         op_name = name or fn.__name__
         if op_name in self._ops:
@@ -128,7 +129,7 @@ class OpRegistry:
         self._ops[op_name] = op
         return op
 
-    def get(self, name: str) -> Optional[Op]:
+    def get(self, name: str) -> Op | None:
         return self._ops.get(name)
 
     def all(self) -> list[Op]:

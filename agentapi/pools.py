@@ -18,7 +18,6 @@ from __future__ import annotations
 import asyncio
 from collections import defaultdict, deque
 from contextlib import asynccontextmanager
-from typing import Deque, Optional
 
 from .determinism import real_monotonic
 
@@ -36,7 +35,7 @@ _DEFAULT_TENANT = "__default__"
 
 class Pool:
     def __init__(self, name: str, *, concurrency: int = 64,
-                 rpm: Optional[int] = None,
+                 rpm: int | None = None,
                  max_queue: int = 256,
                  avg_latency_s: float = 2.0,
                  min_concurrency: int = 1,
@@ -50,7 +49,7 @@ class Pool:
 
         self._effective = concurrency           # adaptive, <= concurrency
         self._in_flight = 0
-        self._waiters: dict[str, Deque[asyncio.Future]] = defaultdict(deque)
+        self._waiters: dict[str, deque[asyncio.Future]] = defaultdict(deque)
         self._rotation: list[str] = []          # tenants with pending waiters
         self._cursor = 0
         self._waiting = 0
@@ -69,7 +68,7 @@ class Pool:
             self._throttled_until = 0.0
         return self._effective
 
-    def report_upstream_429(self, retry_after: Optional[float] = None) -> None:
+    def report_upstream_429(self, retry_after: float | None = None) -> None:
         """Upstream refused us. Halve effective concurrency and hold it for a
         cooldown; the pool is over its real share of a shared quota."""
         self._effective = max(self.min_concurrency, self._effective // 2)
@@ -133,8 +132,8 @@ class Pool:
             future.set_result(None)
 
     @asynccontextmanager
-    async def acquire(self, *, tenant: Optional[str] = None,
-                      deadline_remaining: Optional[float] = None):
+    async def acquire(self, *, tenant: str | None = None,
+                      deadline_remaining: float | None = None):
         estimated = self._estimated_wait()
         if deadline_remaining is not None and estimated > deadline_remaining:
             raise PoolSaturated(

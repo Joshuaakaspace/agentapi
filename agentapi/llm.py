@@ -9,7 +9,8 @@ from __future__ import annotations
 
 import json
 import os
-from typing import Any, AsyncIterator, Optional
+from collections.abc import AsyncIterator
+from typing import Any
 
 from .context import get_ctx
 from .partial import PartialModel, complete_json
@@ -19,7 +20,7 @@ from .pools import Pool
 class BaseLLM:
     """Provider interface. Implement ``_complete`` and ``_stream``."""
 
-    def __init__(self, *, pool: Optional[Pool] = None,
+    def __init__(self, *, pool: Pool | None = None,
                  usd_per_input_mtok: float = 3.0,
                  usd_per_output_mtok: float = 15.0,
                  hooks: Any = None) -> None:
@@ -169,7 +170,7 @@ class BaseLLM:
 class AnthropicLLM(BaseLLM):
     """Claude API provider over httpx (streaming via SSE)."""
 
-    def __init__(self, api_key: Optional[str] = None,
+    def __init__(self, api_key: str | None = None,
                  base_url: str = "https://api.anthropic.com", **kwargs: Any) -> None:
         super().__init__(**kwargs)
         self.api_key = api_key or os.environ.get("ANTHROPIC_API_KEY", "")
@@ -199,10 +200,11 @@ class AnthropicLLM(BaseLLM):
         import httpx
         payload = {"model": model, "messages": messages,
                    "max_tokens": max_tokens, "stream": True, **params}
-        async with httpx.AsyncClient(timeout=600) as client:
-            async with client.stream("POST", f"{self.base_url}/v1/messages",
-                                     headers=self._headers(),
-                                     json=payload) as response:
+        async with (
+            httpx.AsyncClient(timeout=600) as client,
+            client.stream("POST", f"{self.base_url}/v1/messages",
+                          headers=self._headers(), json=payload) as response,
+        ):
                 response.raise_for_status()
                 async for line in response.aiter_lines():
                     if not line.startswith("data:"):
@@ -227,7 +229,7 @@ class MockLLM(BaseLLM):
     tool-use turn: ``{"tool_use": [{"name": "search", "input": {...}}],
     "text": "optional preamble"}``."""
 
-    def __init__(self, script: Optional[list[str]] = None, **kwargs: Any) -> None:
+    def __init__(self, script: list[str] | None = None, **kwargs: Any) -> None:
         super().__init__(**kwargs)
         self.script = script or []
         self._cursor = 0

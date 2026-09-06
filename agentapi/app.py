@@ -28,19 +28,18 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
-import inspect
 import json
 import logging
-from typing import Any, Callable, Optional, get_type_hints
+from collections.abc import Callable
+from typing import Any
 
-from pydantic import BaseModel
 from starlette.applications import Starlette
 from starlette.requests import Request
 from starlette.responses import JSONResponse, Response, StreamingResponse
 from starlette.routing import Mount, Route, WebSocketRoute
 from starlette.websockets import WebSocket, WebSocketDisconnect
 
-from .auth import ANONYMOUS, AuthError, Authenticator, Principal, owns
+from .auth import ANONYMOUS, Authenticator, AuthError, Principal, owns
 from .context import RunContext, parse_duration
 from .determinism import MODES as DETERMINISM_MODES
 from .events import parse_event
@@ -49,13 +48,25 @@ from .journal import SQLiteBackend
 from .llm import BaseLLM
 from .mcp import MCPServer
 from .ops import OpRegistry, _schema_from_signature
-from .pools import Pool, PoolSaturated
-from .run import RunManager, RunStatus
+from .pools import Pool
+from .ratelimit import RateLimit, RateLimited
+from .redaction import NullRedactor
+from .run import RunManager
 from .sessions import SessionRouter
 from .skills import Skill, SkillSet
 
 
-def _make_backend(durable: Optional[str | Any]):
+def _make_fanout(fanout: str | Any | None):
+    """``fanout=`` accepts a redis:// URL or a ready-made fanout object."""
+    if fanout is None:
+        return None
+    if isinstance(fanout, str):
+        from .fanout import RedisFanout
+        return RedisFanout(fanout)
+    return fanout
+
+
+def _make_backend(durable: str | Any | None):
     """``durable=`` accepts a SQLite path, a postgres:// DSN, or a
     ready-made backend object."""
     if durable is None:
@@ -77,9 +88,10 @@ def _auth_response(exc: AuthError) -> JSONResponse:
 
 class _RunRoute:
     def __init__(self, path: str, handler: Callable[..., Any], *,
-                 on_disconnect: str, deadline: Optional[float],
-                 budget_usd: Optional[float], budget_tokens: Optional[int],
-                 pools: list[Pool], durability: str) -> None:
+                 on_disconnect: str, deadline: float | None,
+                 budget_usd: float | None, budget_tokens: int | None,
+                 pools: list[Pool], durability: str,
+                 rate_limit: Any = None) -> None:
         self.path = path
         self.handler = handler
         self.on_disconnect = on_disconnect
@@ -88,43 +100,51 @@ class _RunRoute:
         self.budget_tokens = budget_tokens
         self.pools = pools
         self.durability = durability
+        self.rate_limit = rate_limit
         self.args_model, self.args_schema = _schema_from_signature(handler)
 
 
 class AgentAPI:
     def __init__(self, *, title: str = "agentapi", version: str = "0.1.0",
-                 llm: Optional[BaseLLM] = None,
+                 llm: BaseLLM | None = None,
                  retention_s: float = 3600.0,
-                 durable: Optional[str] = None,
+                 durable: str | None = None,
                  determinism: str = "raise",
-                 require_auth: bool = False) -> None:
+                 require_auth: bool = False,
+                 redactor: Any = None,
+                 rate_limit: RateLimit | None = None,
+                 fanout: Any = None) -> None:
         if determinism not in DETERMINISM_MODES:
             raise ValueError(
                 f"determinism must be one of {DETERMINISM_MODES}")
         self.determinism = determinism
         self.require_auth = require_auth
-        self._authenticator: Optional[Authenticator] = None
+        self._authenticator: Authenticator | None = None
         self.title = title
         self.version = version
         self.llm = llm
         self.backend = _make_backend(durable)
-        self.runs = RunManager(retention_s=retention_s, backend=self.backend)
+        self.redactor = redactor or NullRedactor()
+        self.rate_limit = rate_limit
+        self.fanout = _make_fanout(fanout)
+        self.runs = RunManager(retention_s=retention_s, backend=self.backend,
+                               redactor=self.redactor, fanout=self.fanout)
         self.ops = OpRegistry()
         self.hooks = Hooks()
         self.skills = SkillSet()
         self.pools: dict[str, Pool] = {}
-        self.router: Optional[SessionRouter] = None
+        self.router: SessionRouter | None = None
         self._run_routes: dict[str, _RunRoute] = {}
         self._mounts: list[tuple[str, Any]] = []
-        self._openai_route: Optional[str] = None
-        self._asgi: Optional[Starlette] = None
+        self._openai_route: str | None = None
+        self._asgi: Starlette | None = None
         self.mcp = MCPServer(title, self._McpOps(self), version)
         if llm is not None:
             llm.hooks = self.hooks
 
     class _McpOps:
         """Ops view for MCP that includes skill ops."""
-        def __init__(self, app: "AgentAPI") -> None:
+        def __init__(self, app: AgentAPI) -> None:
             self.app = app
 
         def mcp_tools(self) -> list[dict[str, Any]]:
@@ -145,11 +165,13 @@ class AgentAPI:
 
     # -- decorators ----------------------------------------------------------
     def run(self, path: str, *, on_disconnect: str = "detach",
-            deadline: Optional[str | float] = None,
-            budget_usd: Optional[float] = None,
-            budget_tokens: Optional[int] = None,
-            pools: Optional[list[Pool]] = None,
-            durability: str = "resumable") -> Callable[[Callable], Callable]:
+            deadline: str | float | None = None,
+            budget_usd: float | None = None,
+            budget_tokens: int | None = None,
+            pools: list[Pool] | None = None,
+            durability: str = "resumable",
+            rate_limit: RateLimit | None = None,
+            ) -> Callable[[Callable], Callable]:
         """Register a run handler. The handler is an async generator yielding
         Events (streaming) or a coroutine returning a result (request/response
         over the same run machinery)."""
@@ -167,13 +189,14 @@ class AgentAPI:
                 on_disconnect=on_disconnect,
                 deadline=None if deadline is None else parse_duration(deadline),
                 budget_usd=budget_usd, budget_tokens=budget_tokens,
-                pools=pools or [], durability=durability)
+                pools=pools or [], durability=durability,
+                rate_limit=rate_limit)
             return fn
         return decorate
 
-    def op(self, fn: Optional[Callable[..., Any]] = None, *,
-           name: Optional[str] = None, description: Optional[str] = None,
-           http: Optional[str] = None, llm_tool: bool = True,
+    def op(self, fn: Callable[..., Any] | None = None, *,
+           name: str | None = None, description: str | None = None,
+           http: str | None = None, llm_tool: bool = True,
            mcp: bool = True) -> Any:
         """Register a multi-surface op: HTTP + LLM tool + MCP from one
         signature."""
@@ -257,7 +280,7 @@ class AgentAPI:
         return tools
 
     async def call_op(self, name: str, arguments: dict[str, Any],
-                      call_id: Optional[str] = None) -> Any:
+                      call_id: str | None = None) -> Any:
         """Dispatch a model-issued tool call by name (agent loop helper)."""
         op = self.mcp.ops.get(name)
         if op is None:
@@ -265,8 +288,8 @@ class AgentAPI:
         return await op.call(arguments, hooks=self.hooks, call_id=call_id)
 
     async def agent(self, *, model: str, messages: list[dict[str, Any]],
-                    system: Optional[str] = None,
-                    tools: Optional[list[str]] = None,
+                    system: str | None = None,
+                    tools: list[str] | None = None,
                     max_turns: int = 10, **params: Any) -> dict[str, Any]:
         """Run an LLM tool loop against this app's ops inside the current
         run. See agentapi.agent.agent_loop."""
@@ -277,7 +300,7 @@ class AgentAPI:
 
     # -- run creation (shared by all transports) -----------------------------
     def _start_run(self, route: _RunRoute, kwargs: dict[str, Any], *,
-                   principal: Principal, idempotency_key: Optional[str]):
+                   principal: Principal, idempotency_key: str | None):
         if idempotency_key:
             # Scope the key to the caller: two tenants using the same key
             # must not collide, and one must never receive the other's run.
@@ -417,6 +440,15 @@ class AgentAPI:
                 parsed = route.args_model.model_validate(body)
             except Exception as exc:  # noqa: BLE001 - validation error
                 return JSONResponse({"error": str(exc)}, status_code=422)
+
+            limiter = route.rate_limit or self.rate_limit
+            if limiter is not None:
+                try:
+                    limiter.check(limiter.key_for(principal))
+                except RateLimited as exc:
+                    return JSONResponse(
+                        {"error": str(exc)}, status_code=429,
+                        headers={"Retry-After": str(max(1, int(exc.retry_after) + 1))})
             kwargs = {k: getattr(parsed, k) for k in type(parsed).model_fields}
 
             # Deadline-aware admission before any work happens.
@@ -629,6 +661,22 @@ class AgentAPI:
                       "total_tokens": usage.input_tokens + usage.output_tokens},
         }, headers={"x-run-id": run.id})
 
+    def _fanout_sse(self, run_id: str, from_seq: int) -> StreamingResponse:
+        from .fanout import attach
+
+        async def body():
+            async for event in attach(self.fanout, self.backend, run_id,
+                                      from_seq):
+                payload = event.model_dump(by_alias=True)
+                yield (f"id: {event.seq}\n"
+                       f"event: {event.type}\n"
+                       f"data: {json.dumps(payload, default=str)}\n\n")
+
+        return StreamingResponse(
+            body(), media_type="text/event-stream",
+            headers={"x-run-id": run_id, "x-served-by": "fanout",
+                     "cache-control": "no-cache"})
+
     # -- endpoints -----------------------------------------------------------
     async def _get_run(self, request: Request) -> Response:
         try:
@@ -656,12 +704,20 @@ class AgentAPI:
             principal = await self._principal(request)
         except AuthError as exc:
             return _auth_response(exc)
-        run = self.runs.get(request.path_params["run_id"])
+        run_id = request.path_params["run_id"]
+        run = self.runs.get(run_id)
         if run is not None:
             try:
                 self._authorize_run(principal, run)
             except AuthError as exc:
                 return _auth_response(exc)
+        if run is None and self.fanout is not None and self.backend is not None:
+            # Another worker owns this run; serve the same resumable stream
+            # by replaying the journal then following the fanout.
+            stored = self.backend.get_run(run_id)
+            if stored is not None:
+                from_seq = int(request.query_params.get("from", 0))
+                return self._fanout_sse(run_id, from_seq)
         if run is None:
             if self.backend is not None:
                 stored = self.backend.events(request.path_params["run_id"])

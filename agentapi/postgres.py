@@ -15,7 +15,7 @@ cannot both resume the same run and double its side effects.
 from __future__ import annotations
 
 import json
-from typing import Any, Optional
+from typing import Any
 
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS runs (
@@ -66,7 +66,7 @@ CREATE TABLE IF NOT EXISTS llm_calls (
 class PostgresBackend:
     """Journal backed by PostgreSQL. Interface-compatible with SQLiteBackend."""
 
-    def __init__(self, dsn: str, *, worker_id: Optional[str] = None,
+    def __init__(self, dsn: str, *, worker_id: str | None = None,
                  group_commit_s: float = 0.0,
                  claim_lease_s: float = 300.0) -> None:
         try:
@@ -110,7 +110,7 @@ class PostgresBackend:
 
     # -- runs ---------------------------------------------------------------
     def create_run(self, run_id: str, route: str, kwargs: dict[str, Any], *,
-                   tenant: Optional[str], metadata: dict[str, Any]) -> None:
+                   tenant: str | None, metadata: dict[str, Any]) -> None:
         import time
         self._run(
             "INSERT INTO runs (id, route, kwargs, status, tenant, metadata,"
@@ -125,7 +125,7 @@ class PostgresBackend:
         self._run("UPDATE runs SET status=%s, finished_at=%s WHERE id=%s",
                   (status, time.time() if finished else None, run_id))
 
-    def get_run(self, run_id: str) -> Optional[dict[str, Any]]:
+    def get_run(self, run_id: str) -> dict[str, Any] | None:
         rows = self._run(
             "SELECT id, route, kwargs, status, tenant, metadata, created_at,"
             " finished_at FROM runs WHERE id=%s", (run_id,))

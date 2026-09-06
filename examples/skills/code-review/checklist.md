@@ -1,0 +1,5 @@
+- Off-by-one in slices and ranges
+- Unhandled error paths and swallowed exceptions
+- Resource leaks (files, sockets, subprocesses)
+- Concurrency: shared mutable state, missing await
+- Input validation on anything crossing a trust boundary

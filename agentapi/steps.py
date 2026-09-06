@@ -8,12 +8,13 @@ from __future__ import annotations
 
 import asyncio
 import functools
+import hashlib
 import inspect
 import json
-import hashlib
-from typing import Any, Callable, Optional, TypeVar
+from collections.abc import Callable
+from typing import Any, TypeVar
 
-from .context import get_ctx, parse_duration, _step_depth
+from .context import _step_depth, get_ctx, parse_duration
 from .determinism import suppressed
 
 F = TypeVar("F", bound=Callable[..., Any])
@@ -27,9 +28,9 @@ def _step_key(name: str, args: tuple, kwargs: dict) -> str:
     return f"{name}:{hashlib.sha256(payload.encode()).hexdigest()[:16]}"
 
 
-def step(fn: Optional[F] = None, *, retries: int = 0,
-         backoff: float = 0.5, timeout: Optional[str | float] = None,
-         name: Optional[str] = None) -> Any:
+def step(fn: F | None = None, *, retries: int = 0,
+         backoff: float = 0.5, timeout: str | float | None = None,
+         name: str | None = None) -> Any:
     """Wrap a coroutine function as a journaled, retryable step.
 
         @step(retries=3, timeout="30s")
@@ -51,7 +52,7 @@ def step(fn: Optional[F] = None, *, retries: int = 0,
             if key in journal:
                 return journal[key]
             timeout_s = None if timeout is None else parse_duration(timeout)
-            last_exc: Optional[BaseException] = None
+            last_exc: BaseException | None = None
             for attempt in range(retries + 1):
                 context.check()
                 try:

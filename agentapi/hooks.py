@@ -15,7 +15,8 @@ from __future__ import annotations
 import inspect
 import logging
 from collections import defaultdict
-from typing import Any, Callable
+from collections.abc import Callable
+from typing import Any
 
 logger = logging.getLogger("agentapi.hooks")
 
@@ -49,6 +50,6 @@ class Hooks:
                 logger.exception("hook %s (%s) raised", name,
                                  getattr(fn, "__name__", fn))
 
-    def merge(self, other: "Hooks") -> None:
+    def merge(self, other: Hooks) -> None:
         for name, fns in other._hooks.items():
             self._hooks[name].extend(fns)

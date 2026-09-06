@@ -9,7 +9,7 @@ deadlines apply to every model turn.
 from __future__ import annotations
 
 import json
-from typing import Any, Optional
+from typing import Any
 
 from .context import get_ctx
 from .events import Message
@@ -17,8 +17,8 @@ from .events import Message
 
 async def agent_loop(app: Any, *, model: str,
                      messages: list[dict[str, Any]],
-                     system: Optional[str] = None,
-                     tools: Optional[list[str]] = None,
+                     system: str | None = None,
+                     tools: list[str] | None = None,
                      max_turns: int = 10,
                      **params: Any) -> dict[str, Any]:
     """Run the tool loop. ``tools`` is a list of op names (None = all ops

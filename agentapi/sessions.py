@@ -20,8 +20,9 @@ across — vLLM replicas, provider regions, worker processes.
 from __future__ import annotations
 
 import time
+from collections.abc import Iterable
 from dataclasses import dataclass, field
-from typing import Any, Iterable, Optional
+from typing import Any
 
 
 def token_prefix(messages: Iterable[dict[str, Any]], *,
@@ -45,7 +46,8 @@ def token_prefix(messages: Iterable[dict[str, Any]], *,
 
 def common_prefix_len(a: Iterable[str], b: Iterable[str]) -> int:
     count = 0
-    for left, right in zip(a, b):
+    # Lengths differ by design: we want the shared head, not equal lengths.
+    for left, right in zip(a, b, strict=False):
         if left != right:
             break
         count += 1
@@ -87,7 +89,7 @@ class Backend:
 @dataclass
 class Session:
     id: str
-    backend: Optional[str] = None
+    backend: str | None = None
     created_at: float = 0.0
     last_seen: float = 0.0
     turns: int = 0
@@ -132,8 +134,8 @@ class SessionRouter:
         return len(stale)
 
     # -- placement ----------------------------------------------------------
-    def route(self, *, session_id: Optional[str] = None,
-              messages: Optional[list[dict[str, Any]]] = None) -> Backend:
+    def route(self, *, session_id: str | None = None,
+              messages: list[dict[str, Any]] | None = None) -> Backend:
         """Pick a backend for this turn.
 
         Order of preference:
@@ -154,7 +156,7 @@ class SessionRouter:
                 self._admit(sticky, session, prefix, sticky_hit=True)
                 return sticky
 
-        chosen: Optional[Backend] = None
+        chosen: Backend | None = None
         if prefix:
             scored = [(b.prefix_score(prefix), -b.load, b)
                       for b in self.backends.values() if not b.saturated]
@@ -174,7 +176,7 @@ class SessionRouter:
         self._admit(chosen, session, prefix, sticky_hit=False)
         return chosen
 
-    def _admit(self, backend: Backend, session: Optional[Session],
+    def _admit(self, backend: Backend, session: Session | None,
                prefix: tuple[str, ...], *, sticky_hit: bool) -> None:
         if session is not None:
             session.backend = backend.name
